@@ -484,13 +484,20 @@ async function apiRequest<T>(
     }
   }
 
-  const payload = (await res.json().catch(() => ({}))) as {
+  const contentType = res.headers.get('content-type') || '';
+  const payload = (
+    contentType.includes('application/json') ? await res.json().catch(() => ({})) : {}
+  ) as {
     error?: string;
     suggestedRole?: UserRole;
   } & T;
   if (!res.ok) {
+    const fallbackMessage =
+      res.status === 404 && !contentType.includes('application/json')
+        ? 'SmartQueue API backend is not reachable at /api (404). Make sure the Node.js server (server.ts) is running.'
+        : `Request failed (${res.status})`;
     throw new ApiError(
-      payload.error || `Request failed (${res.status})`,
+      payload.error || fallbackMessage,
       res.status,
       payload.suggestedRole
     );

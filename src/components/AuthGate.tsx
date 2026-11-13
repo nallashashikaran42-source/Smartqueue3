@@ -17,6 +17,7 @@ import {
   ArrowLeft,
 } from 'lucide-react';
 import { signInWithPopup, signOut } from 'firebase/auth';
+import firebaseConfig from '../../firebase-applet-config.json';
 import { auth, googleProvider, syncUserToFirestore } from '../firebase';
 import { api, ApiError, type AuthUser, type UserRole } from '../services/api';
 
@@ -219,7 +220,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({ onAuthenticated }) => {
         } else if (code === 'auth/unauthorized-domain') {
           const host = typeof window !== 'undefined' ? window.location.hostname : 'this domain';
           setError(
-            `Domain "${host}" is not authorized in Firebase Authentication. Add "${host}" under Firebase Console → Authentication → Settings → Authorized domains.`
+            `Domain "${host}" is not authorized for Firebase project "${firebaseConfig.projectId}". In Firebase Console, open project "${firebaseConfig.projectId}" → Authentication → Settings → Authorized domains and add the exact hostname "${host}" (without https://).`
           );
         } else if (err instanceof Error && err.message.startsWith('{')) {
           try {
