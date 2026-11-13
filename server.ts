@@ -3,6 +3,8 @@ import http from 'node:http';
 import path from 'node:path';
 import express from 'express';
 import { ENV } from './server/config/env.ts';
+import { dbStore } from './server/db/store.ts';
+import { mongoPersistence } from './server/db/mongo.ts';
 import { authRoutes } from './server/routes/authRoutes.ts';
 import { orgStructureRoutes } from './server/routes/orgStructureRoutes.ts';
 import { queueRoutes } from './server/routes/queueRoutes.ts';
@@ -14,13 +16,18 @@ import { adminRoutes } from './server/routes/adminRoutes.ts';
 import { wsHub } from './server/socket/wsHub.ts';
 
 export async function createAppServer() {
+  await dbStore.init();
+
   const app = express();
   app.use(express.json());
 
   app.get('/api/health', (_req, res) => {
+    const mongo = mongoPersistence.getStatus();
     res.json({
       status: 'ok',
       service: 'smartqueue-api',
+      database: mongo.connected ? 'mongodb' : 'local-json',
+      mongoDbName: mongo.dbName,
       timestamp: new Date().toISOString(),
     });
   });

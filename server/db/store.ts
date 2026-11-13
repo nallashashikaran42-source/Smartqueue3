@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { ENV } from '../config/env.ts';
+import { mongoPersistence } from './mongo.ts';
 import {
   hashPassword,
   normalizeRole,
@@ -750,6 +751,8 @@ export function createSeedDatabase(): SmartQueueDatabase {
 
 class DatabaseStore {
   private data: SmartQueueDatabase;
+  private mongoQueue: Promise<void> = Promise.resolve();
+  private initialized = false;
 
   constructor() {
     this.data = this.loadFromDisk();
@@ -766,6 +769,78 @@ class DatabaseStore {
     });
   }
 
+  private normalizeDatabase(parsed: Partial<SmartQueueDatabase>): SmartQueueDatabase {
+    const seed = createSeedDatabase();
+    const users = (parsed.users && parsed.users.length > 0 ? parsed.users : seed.users).map((u) => ({
+      ...u,
+      role: normalizeRole(u.role),
+      accountStatus: u.accountStatus || 'active',
+    }));
+    for (const seedUser of seed.users) {
+      if (!users.some((u) => u.email.toLowerCase() === seedUser.email.toLowerCase())) {
+        users.push(seedUser);
+      }
+    }
+    const facilities = (
+      parsed.facilities && parsed.facilities.length > 0 ? parsed.facilities : seed.facilities
+    ).map((f) => ({
+      ...f,
+      workingHours: f.workingHours || '08:00 – 18:00',
+      isActive: f.isActive !== false,
+    }));
+    const departments =
+      Array.isArray(parsed.departments) && parsed.departments.length > 0
+        ? parsed.departments
+        : seed.departments;
+    const queues = (
+      parsed.queues && parsed.queues.length > 0 ? parsed.queues : seed.queues
+    ).map((q) => {
+      const fallbackDept =
+        departments.find((d) => d.facilityId === q.facilityId)?.id || 'dept-opd';
+      return {
+        ...q,
+        departmentId: q.departmentId || fallbackDept,
+        isActive: q.isActive !== false,
+        isPaused: Boolean(q.isPaused),
+      };
+    });
+    const counters = (parsed.counters && parsed.counters.length > 0 ? parsed.counters : seed.counters).map(
+      (c) => {
+        const q = queues.find((fq) => fq.id === c.queueId);
+        return {
+          ...c,
+          departmentId: c.departmentId || q?.departmentId || 'dept-opd',
+        };
+      }
+    );
+    const tokens = (parsed.tokens || seed.tokens).map((t) => {
+      const q = queues.find((fq) => fq.id === t.queueId);
+      return {
+        ...t,
+        departmentId: t.departmentId || q?.departmentId || 'dept-opd',
+      };
+    });
+    return {
+      users,
+      organisations:
+        parsed.organisations && parsed.organisations.length > 0
+          ? parsed.organisations
+          : seed.organisations,
+      facilities,
+      departments,
+      queues,
+      counters,
+      tokens,
+      swaps: parsed.swaps || seed.swaps,
+      notifications: Array.isArray(parsed.notifications) ? parsed.notifications : seed.notifications,
+      auditLogs: Array.isArray(parsed.auditLogs) ? parsed.auditLogs : seed.auditLogs,
+      refreshSessions: Array.isArray(parsed.refreshSessions) ? parsed.refreshSessions : [],
+      settings: parsed.settings || createDefaultSettings(),
+      hourlyTraffic: parsed.hourlyTraffic || seed.hourlyTraffic,
+      metrics: parsed.metrics || seed.metrics,
+    };
+  }
+
   private loadFromDisk(): SmartQueueDatabase {
     const seed = createSeedDatabase();
     try {
@@ -773,77 +848,37 @@ class DatabaseStore {
         const raw = fs.readFileSync(ENV.DB_FILE_PATH, 'utf8');
         const parsed = JSON.parse(raw) as Partial<SmartQueueDatabase>;
         if (parsed && Array.isArray(parsed.facilities) && Array.isArray(parsed.queues)) {
-          const users = (parsed.users || seed.users).map((u) => ({
-            ...u,
-            role: normalizeRole(u.role),
-            accountStatus: u.accountStatus || 'active',
-          }));
-          for (const seedUser of seed.users) {
-            if (!users.some((u) => u.email.toLowerCase() === seedUser.email.toLowerCase())) {
-              users.push(seedUser);
-            }
-          }
-          const facilities = parsed.facilities.map((f) => ({
-            ...f,
-            workingHours: f.workingHours || '08:00 – 18:00',
-            isActive: f.isActive !== false,
-          }));
-          const departments =
-            Array.isArray(parsed.departments) && parsed.departments.length > 0
-              ? parsed.departments
-              : seed.departments;
-          const queues = parsed.queues.map((q) => {
-            const fallbackDept =
-              departments.find((d) => d.facilityId === q.facilityId)?.id || 'dept-opd';
-            return {
-              ...q,
-              departmentId: q.departmentId || fallbackDept,
-              isActive: q.isActive !== false,
-              isPaused: Boolean(q.isPaused),
-            };
-          });
-          const counters = (parsed.counters || seed.counters).map((c) => {
-            const q = queues.find((fq) => fq.id === c.queueId);
-            return {
-              ...c,
-              departmentId: c.departmentId || q?.departmentId || 'dept-opd',
-            };
-          });
-          const tokens = (parsed.tokens || seed.tokens).map((t) => {
-            const q = queues.find((fq) => fq.id === t.queueId);
-            return {
-              ...t,
-              departmentId: t.departmentId || q?.departmentId || 'dept-opd',
-            };
-          });
-          return {
-            users,
-            organisations: parsed.organisations || seed.organisations,
-            facilities,
-            departments,
-            queues,
-            counters,
-            tokens,
-            swaps: parsed.swaps || seed.swaps,
-            notifications: Array.isArray(parsed.notifications)
-              ? parsed.notifications
-              : seed.notifications,
-            auditLogs: Array.isArray(parsed.auditLogs) ? parsed.auditLogs : seed.auditLogs,
-            refreshSessions: Array.isArray(parsed.refreshSessions) ? parsed.refreshSessions : [],
-            settings: parsed.settings || createDefaultSettings(),
-            hourlyTraffic: parsed.hourlyTraffic || seed.hourlyTraffic,
-            metrics: parsed.metrics || seed.metrics,
-          };
+          return this.normalizeDatabase(parsed);
         }
       }
     } catch {
       // Fallback to fresh seed database if file is unreadable or corrupt
     }
-    this.persist(seed);
+    this.persistLocal(seed);
     return seed;
   }
 
-  private persist(snapshot: SmartQueueDatabase): void {
+  async init(): Promise<void> {
+    if (this.initialized) return;
+    this.initialized = true;
+
+    const connected = await mongoPersistence.connect();
+    if (!connected) return;
+
+    try {
+      const remoteData = await mongoPersistence.loadDatabase();
+      if (remoteData && remoteData.facilities && remoteData.facilities.length > 0) {
+        this.data = this.normalizeDatabase(remoteData);
+        this.persistLocal(this.data);
+      } else {
+        await mongoPersistence.saveDatabase(this.data);
+      }
+    } catch (err) {
+      console.error('Failed to synchronize initial MongoDB state:', err);
+    }
+  }
+
+  private persistLocal(snapshot: SmartQueueDatabase): void {
     try {
       const dir = path.dirname(ENV.DB_FILE_PATH);
       if (!fs.existsSync(dir)) {
@@ -857,18 +892,30 @@ class DatabaseStore {
     }
   }
 
+  private queueMongoPersist(): void {
+    if (!mongoPersistence.isConnected()) return;
+    const snapshot = structuredClone(this.data);
+    this.mongoQueue = this.mongoQueue
+      .then(() => mongoPersistence.saveDatabase(snapshot))
+      .catch((err) => {
+        console.error('Failed to sync SmartQueue update to MongoDB:', err);
+      });
+  }
+
   getState(): SmartQueueDatabase {
     return this.data;
   }
 
   save(): void {
-    this.persist(this.data);
+    this.persistLocal(this.data);
+    this.queueMongoPersist();
   }
 
   reset(): SmartQueueDatabase {
     const fresh = createSeedDatabase();
     this.data = fresh;
-    this.persist(this.data);
+    this.persistLocal(this.data);
+    this.queueMongoPersist();
     return this.data;
   }
 }
