@@ -4,6 +4,12 @@ import type {
   HourlyTrafficPoint,
   QueuePriority,
 } from '../data/smartQueueData';
+import {
+  handleStaticApiRequest,
+  isStaticHostMode,
+  setStaticHostMode,
+  StaticApiHttpError,
+} from './staticFallbackEngine';
 
 export type UserRole = 'citizen' | 'operator' | 'admin';
 export type AccountStatus = 'active' | 'inactive';
@@ -422,13 +428,33 @@ export function setStoredTokens(token: string | null, refreshToken?: string | nu
   }
 }
 
+const API_BASE = ((import.meta as { env?: Record<string, string | undefined> }).env?.VITE_API_BASE_URL || '').replace(/\/+$/, '');
+
+function resolveApiUrl(url: string): string {
+  return API_BASE ? `${API_BASE}${url}` : url;
+}
+
 let refreshPromise: Promise<string | null> | null = null;
 
 async function tryRefreshAccessToken(): Promise<string | null> {
   const rt = getStoredRefreshToken();
   if (!rt) return null;
+  if (isStaticHostMode()) {
+    try {
+      const data = await handleStaticApiRequest<{ token: string; refreshToken: string }>(
+        '/api/auth/refresh',
+        { method: 'POST', body: JSON.stringify({ refreshToken: rt }) },
+        getStoredAuthToken()
+      );
+      setStoredTokens(data.token, data.refreshToken);
+      return data.token;
+    } catch {
+      setStoredTokens(null, null);
+      return null;
+    }
+  }
   if (!refreshPromise) {
-    refreshPromise = fetch('/api/auth/refresh', {
+    refreshPromise = fetch(resolveApiUrl('/api/auth/refresh'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ refreshToken: rt }),
@@ -462,13 +488,28 @@ export class ApiError extends Error {
   }
 }
 
+async function runStaticFallback<T>(url: string, options: RequestInit): Promise<T> {
+  try {
+    return await handleStaticApiRequest<T>(url, options, getStoredAuthToken());
+  } catch (err) {
+    if (err instanceof StaticApiHttpError) {
+      throw new ApiError(err.message, err.status, err.suggestedRole);
+    }
+    throw err;
+  }
+}
+
 async function apiRequest<T>(
   url: string,
   options: RequestInit = {},
   retryOn401 = true
 ): Promise<T> {
+  if (isStaticHostMode()) {
+    return runStaticFallback<T>(url, options);
+  }
+
   const token = getStoredAuthToken();
-  const res = await fetch(url, {
+  const res = await fetch(resolveApiUrl(url), {
     ...options,
     headers: {
       'Content-Type': 'application/json',
@@ -477,6 +518,16 @@ async function apiRequest<T>(
     },
   });
 
+  const contentType = res.headers.get('content-type') || '';
+  if (
+    !API_BASE &&
+    !contentType.includes('application/json') &&
+    (res.status === 404 || contentType.includes('text/html'))
+  ) {
+    setStaticHostMode(true);
+    return runStaticFallback<T>(url, options);
+  }
+
   if (res.status === 401 && retryOn401 && !url.startsWith('/api/auth/login') && !url.startsWith('/api/auth/refresh')) {
     const newAccess = await tryRefreshAccessToken();
     if (newAccess) {
@@ -484,7 +535,6 @@ async function apiRequest<T>(
     }
   }
 
-  const contentType = res.headers.get('content-type') || '';
   const payload = (
     contentType.includes('application/json') ? await res.json().catch(() => ({})) : {}
   ) as {

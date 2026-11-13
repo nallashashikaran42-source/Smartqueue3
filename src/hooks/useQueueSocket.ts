@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import { isStaticHostMode, subscribeStaticQueueEvents } from '../services/staticFallbackEngine';
 
 export interface QueueWsMessage {
   event: string;
@@ -17,20 +18,39 @@ export function useQueueSocket(
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
+    const unsubscribeStatic = subscribeStaticQueueEvents(facilityId, (msg) => {
+      onEventRef.current(msg);
+    });
+
+    if (isStaticHostMode()) {
+      return () => {
+        unsubscribeStatic();
+      };
+    }
+
     let socket: WebSocket | null = null;
     let reconnectTimer: number | null = null;
     let disposed = false;
+    let failedAttempts = 0;
 
     const connect = () => {
-      if (disposed) return;
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const url = `${protocol}//${window.location.host}/ws?facilityId=${encodeURIComponent(
-        facilityId
-      )}`;
+      if (disposed || isStaticHostMode()) return;
+      const apiBase = ((import.meta as { env?: Record<string, string | undefined> }).env?.VITE_API_BASE_URL || '').trim();
+      let wsOrigin = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`;
+      if (apiBase) {
+        try {
+          const parsed = new URL(apiBase);
+          wsOrigin = `${parsed.protocol === 'https:' ? 'wss:' : 'ws:'}//${parsed.host}`;
+        } catch {
+          // Fallback to window host
+        }
+      }
+      const url = `${wsOrigin}/ws?facilityId=${encodeURIComponent(facilityId)}`;
 
       socket = new WebSocket(url);
 
       socket.onopen = () => {
+        failedAttempts = 0;
         socket?.send(JSON.stringify({ type: 'subscribe', facilityId }));
       };
 
@@ -44,7 +64,8 @@ export function useQueueSocket(
       };
 
       socket.onclose = () => {
-        if (!disposed) {
+        if (!disposed && !isStaticHostMode() && failedAttempts < 3) {
+          failedAttempts += 1;
           reconnectTimer = window.setTimeout(connect, 2500);
         }
       };
@@ -58,6 +79,7 @@ export function useQueueSocket(
 
     return () => {
       disposed = true;
+      unsubscribeStatic();
       if (reconnectTimer !== null) {
         window.clearTimeout(reconnectTimer);
       }
