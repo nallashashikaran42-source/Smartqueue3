@@ -21,6 +21,7 @@ import type {
 import {
   broadcastFacilitySnapshot,
   getFacilitySnapshot,
+  reallocateCounterStaff,
   recordAuditLog,
 } from '../services/queueEngine.ts';
 
@@ -708,6 +709,37 @@ adminRoutes.patch('/counters/:counterId', (req, res) => {
   dbStore.save();
   broadcastFacilitySnapshot(counter.facilityId, 'counter:updated', { counter });
   res.json({ counter });
+});
+
+adminRoutes.post('/counters/reallocate', (req, res) => {
+  const { counterId, targetQueueId, operatorId, staffName, status } = req.body as {
+    counterId?: string;
+    targetQueueId?: string;
+    operatorId?: string;
+    staffName?: string;
+    status?: CounterStatus;
+  };
+
+  if (!counterId) {
+    res.status(400).json({ error: 'counterId is required to reallocate staff.' });
+    return;
+  }
+
+  try {
+    const result = reallocateCounterStaff({
+      counterId,
+      targetQueueId,
+      operatorId,
+      staffName,
+      status,
+      actor: getActor(req),
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({
+      error: err instanceof Error ? err.message : 'Unable to reallocate counter staff.',
+    });
+  }
 });
 
 // 6. Cross-Facility Queue Monitoring

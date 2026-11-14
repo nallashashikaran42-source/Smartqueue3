@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import {
   api,
+  type AnalyticsSummaryResponse,
   type ApiTokenRecord,
   type AuthUser,
   type CitizenHistoryItem,
@@ -32,6 +33,7 @@ import { DashboardShell, type SidebarNavItem } from '../DashboardShell';
 import { NotificationsView } from '../NotificationsView';
 import { ProfileView } from '../ProfileView';
 import { QrTicketSvg } from '../QrTicketSvg';
+import { CitizenPeakHoursPanel } from './CitizenPeakHoursPanel';
 
 export type CitizenSection =
   | 'home'
@@ -66,6 +68,8 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
 
   const [snapshot, setSnapshot] = useState<FacilitySnapshotResponse | null>(null);
+  const [analyticsSummary, setAnalyticsSummary] = useState<AnalyticsSummaryResponse | null>(null);
+  const [analyticsLoading, setAnalyticsLoading] = useState(false);
   const [activeToken, setActiveToken] = useState<ApiTokenRecord | null>(null);
   const [history, setHistory] = useState<CitizenHistoryItem[]>([]);
   const [historyFilter, setHistoryFilter] = useState<'all' | 'Completed' | 'Cancelled'>('all');
@@ -107,6 +111,19 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
     loadAll();
   }, [loadAll]);
 
+  const loadFacilityAnalytics = useCallback(async (facId: string) => {
+    if (!facId) return;
+    setAnalyticsLoading(true);
+    try {
+      const summary = await api.getAnalyticsSummary(facId);
+      setAnalyticsSummary(summary);
+    } catch {
+      // Non-blocking: ignore transient analytics errors
+    } finally {
+      setAnalyticsLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (!selectedFacilityId) return;
     api
@@ -120,7 +137,8 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
         }
       })
       .catch(() => undefined);
-  }, [selectedFacilityId]);
+    loadFacilityAnalytics(selectedFacilityId);
+  }, [selectedFacilityId, loadFacilityAnalytics]);
 
   const handleWsEvent = useCallback(
     (msg: QueueWsMessage) => {
@@ -142,6 +160,14 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
       if (payload?.snapshot && msg.facilityId === selectedFacilityId) {
         setSnapshot(payload.snapshot);
       }
+      if (
+        msg.facilityId === selectedFacilityId &&
+        (msg.event.startsWith('token:') ||
+          msg.event.startsWith('counter:') ||
+          msg.event.startsWith('org:'))
+      ) {
+        loadFacilityAnalytics(selectedFacilityId);
+      }
       // Refresh overview/history whenever any token lifecycle event happens
       if (msg.event.startsWith('token:') || msg.event.startsWith('grace:') || msg.event.startsWith('swap:')) {
         api
@@ -157,7 +183,7 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
           .catch(() => undefined);
       }
     },
-    [selectedFacilityId, user.id, onToast]
+    [selectedFacilityId, user.id, onToast, loadFacilityAnalytics]
   );
 
   useQueueSocket(activeToken?.facilityId || selectedFacilityId, handleWsEvent);
@@ -477,6 +503,24 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                 )}
               </section>
 
+              {/* Peak Hours & Best Time to Visit */}
+              <CitizenPeakHoursPanel
+                facilityId={currentCenter?.facility.id || selectedFacilityId}
+                facilityName={currentCenter?.facility.name || 'Service Center'}
+                facilities={centers.map((c) => ({
+                  id: c.facility.id,
+                  name: c.facility.name,
+                  city: c.facility.city,
+                }))}
+                onSelectFacility={(fid) => {
+                  setSelectedFacilityId(fid);
+                  setSelectedDeptId('all');
+                }}
+                summary={analyticsSummary}
+                loading={analyticsLoading}
+                onBookAtFacility={() => onNavigate('take-token')}
+              />
+
               {/* Available Hospitals / Service Centers */}
               <section className="space-y-4">
                 <div className="flex items-center justify-between">
@@ -775,6 +819,14 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                   </button>
                 </div>
               </div>
+
+              <CitizenPeakHoursPanel
+                facilityId={currentCenter?.facility.id || selectedFacilityId}
+                facilityName={currentCenter?.facility.name || 'Selected Center'}
+                summary={analyticsSummary}
+                loading={analyticsLoading}
+                compact
+              />
             </div>
           )}
 

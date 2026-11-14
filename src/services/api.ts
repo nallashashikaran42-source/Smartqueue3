@@ -388,6 +388,127 @@ export interface AnalyticsSummaryResponse {
     sdg11CorridorDensityReduction: string;
     sdg12PaperSlipsSaved: number;
   };
+  organisationDashboard?: OrganisationAnalyticsDashboardResponse | null;
+}
+
+export type CrowdLevel = 'Low' | 'Medium' | 'High';
+
+export interface OrganisationAnalyticsDashboardResponse {
+  facilityId: string;
+  facilityName: string;
+  period: 'daily' | 'weekly' | 'monthly';
+  surgeThreshold: number;
+  overviewCards: {
+    peopleInQueue: number;
+    avgServiceTimeMins: number;
+    avgWaitTimeMins: number;
+    activeCounters: number;
+    totalCounters: number;
+    onTimeServiceRate: number;
+    visitorsServedToday: number;
+  };
+  visitorStats: {
+    dailyVisitors: number;
+    weeklyVisitors: number;
+    monthlyVisitors: number;
+    busiestHour: string;
+    busiestHourVisitors: number;
+    peakAvgWaitMins: number;
+    nonPeakAvgWaitMins: number;
+    peakHours: string[];
+    recommendedHours: string[];
+  };
+  hourlyFootfall: Array<{
+    hour: string;
+    hour24: number;
+    footfall: number;
+    liveTokensCount: number;
+    avgWaitMins: number;
+    isPeak: boolean;
+    isRecommended: boolean;
+    crowdLevel: CrowdLevel;
+  }>;
+  upcomingBusyHours: Array<{
+    hour: string;
+    expectedVisitors: number;
+    predictedWaitMins: number;
+    crowdLevel: CrowdLevel;
+    confidence: number;
+    suggestedAction: string;
+  }>;
+  surgeAlerts: Array<{
+    id: string;
+    facilityId: string;
+    facilityName: string;
+    queueId: string;
+    queueName: string;
+    departmentName: string;
+    title: string;
+    waitingCount: number;
+    threshold: number;
+    predictedWaitMins: number;
+    recommendation: string;
+    standbyCounterId: string | null;
+    standbyCounterLabel: string | null;
+    standbyStaffName: string | null;
+  }>;
+  counters: Array<{
+    id: string;
+    facilityId: string;
+    facilityName: string;
+    departmentId: string;
+    departmentName: string;
+    queueId: string;
+    queueName: string;
+    label: string;
+    staffName: string;
+    assignedOperatorId?: string;
+    status: 'Serving' | 'Busy' | 'Paused' | 'Closed';
+    currentToken: string;
+    queueLength: number;
+    estimatedWaitMins: number;
+    avgCycleMins: number;
+  }>;
+  queuePredictions: Array<{
+    queueId: string;
+    queueName: string;
+    facilityId: string;
+    facilityName: string;
+    departmentName: string;
+    waitingCount: number;
+    activeCounters: number;
+    avgServiceMinutes: number;
+    predictedWaitMins: number;
+    crowdLevel: CrowdLevel;
+    approachingThreshold: boolean;
+    overThreshold: boolean;
+    confidence: number;
+    suggestedAction: string;
+    suggestedCounterId: string | null;
+  }>;
+  sustainabilityImpact: {
+    estimatedTimeSavedMinutes: number;
+    estimatedTimeSavedHours: number;
+    physicalWaitReductionPct: number;
+    digitalTokensServed: number;
+    estimatedCrowdReductionPct: number;
+    corridorVisitorsAvoided: number;
+    sdg9InfraCalls: number;
+    sdg12PaperSlipsSaved: number;
+  };
+  operators: Array<{
+    id: string;
+    name: string;
+    assignedFacilityId?: string;
+    assignedCounterId?: string;
+  }>;
+  availableQueues: Array<{
+    id: string;
+    facilityId: string;
+    facilityName: string;
+    departmentId: string;
+    name: string;
+  }>;
 }
 
 const AUTH_TOKEN_KEY = 'smartqueue_auth_token';
@@ -1004,11 +1125,36 @@ export const api = {
     });
   },
 
+  async adminReallocateCounter(body: {
+    counterId: string;
+    targetQueueId?: string;
+    operatorId?: string;
+    staffName?: string;
+    status?: 'Serving' | 'Busy' | 'Paused' | 'Closed';
+  }): Promise<{ counter: ApiCounter; snapshot: FacilitySnapshotResponse }> {
+    return apiRequest('/api/admin/counters/reallocate', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  },
+
   async adminGetAuditLogs(limit = 50): Promise<{ logs: AuditLogItem[] }> {
     return apiRequest(`/api/admin/audit-logs?limit=${limit}`);
   },
 
   async getAnalyticsSummary(facilityId: string): Promise<AnalyticsSummaryResponse> {
     return apiRequest(`/api/analytics/${encodeURIComponent(facilityId)}/summary`);
+  },
+
+  async getOrganisationAnalyticsDashboard(params?: {
+    facilityId?: string;
+    period?: 'daily' | 'weekly' | 'monthly';
+    threshold?: number;
+  }): Promise<OrganisationAnalyticsDashboardResponse> {
+    const qs = new URLSearchParams();
+    if (params?.facilityId) qs.set('facilityId', params.facilityId);
+    if (params?.period) qs.set('period', params.period);
+    if (params?.threshold) qs.set('threshold', String(params.threshold));
+    return apiRequest(`/api/analytics/organisation/dashboard?${qs.toString()}`);
   },
 };

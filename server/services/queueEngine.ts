@@ -892,12 +892,658 @@ export function checkInGraceSlot(
   };
 }
 
+function parseHourLabelTo24(label: string): number {
+  const m = label.trim().match(/^(\d{1,2})\s*(AM|PM)$/i);
+  if (!m) return 10;
+  let hr = Number(m[1]);
+  const meridiem = m[2].toUpperCase();
+  if (meridiem === 'PM' && hr < 12) hr += 12;
+  if (meridiem === 'AM' && hr === 12) hr = 0;
+  return hr;
+}
+
+function getTokenHour24(token: TokenRecord): number {
+  if (token.joinedAt) {
+    const m = token.joinedAt.trim().match(/^(\d{1,2})(?::\d{2})?\s*(AM|PM)$/i);
+    if (m) {
+      let hr = Number(m[1]);
+      const mer = m[2].toUpperCase();
+      if (mer === 'PM' && hr < 12) hr += 12;
+      if (mer === 'AM' && hr === 12) hr = 0;
+      return hr;
+    }
+  }
+  return new Date(token.createdAtMs || Date.now()).getHours();
+}
+
+export type CrowdLevel = 'Low' | 'Medium' | 'High';
+
+export function classifyCrowdLevel(waitingCount: number, predictedWaitMins: number, threshold = 5): CrowdLevel {
+  if (waitingCount >= threshold || predictedWaitMins >= 15) return 'High';
+  if (waitingCount >= Math.max(2, Math.ceil(threshold * 0.6)) || predictedWaitMins >= 8) return 'Medium';
+  return 'Low';
+}
+
+export interface OrganisationAnalyticsDashboard {
+  facilityId: string;
+  facilityName: string;
+  period: 'daily' | 'weekly' | 'monthly';
+  surgeThreshold: number;
+  overviewCards: {
+    peopleInQueue: number;
+    avgServiceTimeMins: number;
+    avgWaitTimeMins: number;
+    activeCounters: number;
+    totalCounters: number;
+    onTimeServiceRate: number;
+    visitorsServedToday: number;
+  };
+  visitorStats: {
+    dailyVisitors: number;
+    weeklyVisitors: number;
+    monthlyVisitors: number;
+    busiestHour: string;
+    busiestHourVisitors: number;
+    peakAvgWaitMins: number;
+    nonPeakAvgWaitMins: number;
+    peakHours: string[];
+    recommendedHours: string[];
+  };
+  hourlyFootfall: Array<{
+    hour: string;
+    hour24: number;
+    footfall: number;
+    liveTokensCount: number;
+    avgWaitMins: number;
+    isPeak: boolean;
+    isRecommended: boolean;
+    crowdLevel: CrowdLevel;
+  }>;
+  upcomingBusyHours: Array<{
+    hour: string;
+    expectedVisitors: number;
+    predictedWaitMins: number;
+    crowdLevel: CrowdLevel;
+    confidence: number;
+    suggestedAction: string;
+  }>;
+  surgeAlerts: Array<{
+    id: string;
+    facilityId: string;
+    facilityName: string;
+    queueId: string;
+    queueName: string;
+    departmentName: string;
+    title: string;
+    waitingCount: number;
+    threshold: number;
+    predictedWaitMins: number;
+    recommendation: string;
+    standbyCounterId: string | null;
+    standbyCounterLabel: string | null;
+    standbyStaffName: string | null;
+  }>;
+  counters: Array<{
+    id: string;
+    facilityId: string;
+    facilityName: string;
+    departmentId: string;
+    departmentName: string;
+    queueId: string;
+    queueName: string;
+    label: string;
+    staffName: string;
+    assignedOperatorId?: string;
+    status: CounterRecord['status'];
+    currentToken: string;
+    queueLength: number;
+    estimatedWaitMins: number;
+    avgCycleMins: number;
+  }>;
+  queuePredictions: Array<{
+    queueId: string;
+    queueName: string;
+    facilityId: string;
+    facilityName: string;
+    departmentName: string;
+    waitingCount: number;
+    activeCounters: number;
+    avgServiceMinutes: number;
+    predictedWaitMins: number;
+    crowdLevel: CrowdLevel;
+    approachingThreshold: boolean;
+    overThreshold: boolean;
+    confidence: number;
+    suggestedAction: string;
+    suggestedCounterId: string | null;
+  }>;
+  sustainabilityImpact: {
+    estimatedTimeSavedMinutes: number;
+    estimatedTimeSavedHours: number;
+    physicalWaitReductionPct: number;
+    digitalTokensServed: number;
+    estimatedCrowdReductionPct: number;
+    corridorVisitorsAvoided: number;
+    sdg9InfraCalls: number;
+    sdg12PaperSlipsSaved: number;
+  };
+  operators: Array<{
+    id: string;
+    name: string;
+    assignedFacilityId?: string;
+    assignedCounterId?: string;
+  }>;
+  availableQueues: Array<{
+    id: string;
+    facilityId: string;
+    facilityName: string;
+    departmentId: string;
+    name: string;
+  }>;
+}
+
+export function getOrganisationAnalyticsDashboard(params: {
+  facilityId?: string;
+  period?: 'daily' | 'weekly' | 'monthly';
+  surgeThreshold?: number;
+} = {}): OrganisationAnalyticsDashboard | null {
+  const db = dbStore.getState();
+  const scopeId = params.facilityId && params.facilityId !== 'all' ? params.facilityId : 'all';
+  const period: 'daily' | 'weekly' | 'monthly' =
+    params.period === 'weekly' || params.period === 'monthly' ? params.period : 'daily';
+  const surgeThreshold = Math.max(3, Math.min(30, Number(params.surgeThreshold) || 5));
+
+  const targetFacilities =
+    scopeId === 'all'
+      ? db.facilities
+      : db.facilities.filter((f) => f.id === scopeId);
+  if (targetFacilities.length === 0) return null;
+
+  const facilityIds = new Set(targetFacilities.map((f) => f.id));
+  const scopedQueues = db.queues.filter((q) => facilityIds.has(q.facilityId) && q.isActive);
+  const scopedCounters = db.counters.filter((c) => facilityIds.has(c.facilityId));
+  const scopedTokens = db.tokens.filter((t) => facilityIds.has(t.facilityId));
+
+  // Build hydrated snapshots per facility
+  const facilitySnapshots = targetFacilities
+    .map((f) => ({ facility: f, snapshot: getFacilitySnapshot(f.id) }))
+    .filter((item): item is { facility: typeof targetFacilities[number]; snapshot: FacilitySnapshot } =>
+      Boolean(item.snapshot)
+    );
+
+  const allHydratedQueues = facilitySnapshots.flatMap(({ facility, snapshot }) =>
+    snapshot.queues.map((q) => ({ ...q, facilityName: facility.name }))
+  );
+
+  const peopleInQueue = allHydratedQueues.reduce((sum, q) => sum + q.waitingCount, 0);
+  const activeCounters = scopedCounters.filter(
+    (c) => c.status === 'Serving' || c.status === 'Busy'
+  ).length;
+  const totalCounters = scopedCounters.length;
+
+  const avgServiceTimeMins =
+    allHydratedQueues.length > 0
+      ? Number(
+          (
+            allHydratedQueues.reduce((sum, q) => sum + q.avgServiceMinutes, 0) /
+            allHydratedQueues.length
+          ).toFixed(1)
+        )
+      : 4;
+
+  const avgWaitTimeMins =
+    allHydratedQueues.length > 0
+      ? Math.round(
+          allHydratedQueues.reduce((sum, q) => sum + q.predictedWaitMins, 0) /
+            allHydratedQueues.length
+        )
+      : 0;
+
+  // Baseline served today from servingNumber counters + live completed tokens + processedDelta
+  const servedFromQueueSequence = scopedQueues.reduce(
+    (sum, q) => sum + Math.max(0, q.servingNumber - 1),
+    0
+  );
+  const completedTokensInStore = scopedTokens.filter((t) => t.status === 'Completed').length;
+  const cancelledOrNoShow = scopedTokens.filter(
+    (t) => t.status === 'NoShow' || t.status === 'Skipped'
+  ).length;
+  const visitorsServedToday = Math.max(
+    completedTokensInStore,
+    servedFromQueueSequence + completedTokensInStore + Math.floor(db.metrics.processedDelta / 2)
+  );
+
+  // Dynamic hourly footfall combining historical baseline + live tokens in store
+  const hourBuckets = new Map<
+    string,
+    { hour: string; hour24: number; baseFootfall: number; baseWaitSum: number; count: number }
+  >();
+
+  for (const fac of targetFacilities) {
+    const series = db.hourlyTraffic[fac.id] || [];
+    for (const pt of series) {
+      const hr24 = parseHourLabelTo24(pt.hour);
+      const existing = hourBuckets.get(pt.hour);
+      if (existing) {
+        existing.baseFootfall += pt.footfall;
+        existing.baseWaitSum += pt.avgWaitMins;
+        existing.count += 1;
+      } else {
+        hourBuckets.set(pt.hour, {
+          hour: pt.hour,
+          hour24: hr24,
+          baseFootfall: pt.footfall,
+          baseWaitSum: pt.avgWaitMins,
+          count: 1,
+        });
+      }
+    }
+  }
+
+  // Fold live token creation counts per hour bucket & active waiting pressure into current/peak slots
+  const liveTokensByHour = new Map<number, number>();
+  for (const tok of scopedTokens) {
+    const hr24 = getTokenHour24(tok);
+    liveTokensByHour.set(hr24, (liveTokensByHour.get(hr24) || 0) + 1);
+  }
+
+  // Capacity relief when standby counters are opened
+  const capacityRatio =
+    totalCounters > 0 ? activeCounters / Math.max(1, totalCounters) : 1;
+  const waitCapacityFactor = Math.max(0.65, Math.min(1.25, 1.15 - (capacityRatio - 0.65) * 0.65));
+
+  const periodScale = period === 'monthly' ? 26 : period === 'weekly' ? 7 : 1;
+  const sortedBuckets = Array.from(hourBuckets.values()).sort((a, b) => a.hour24 - b.hour24);
+
+  const rawDailyHourly = sortedBuckets.map((b) => {
+    const liveInHour = liveTokensByHour.get(b.hour24) || 0;
+    const dailyFootfall = b.baseFootfall + liveInHour;
+    const baseWait = b.count > 0 ? b.baseWaitSum / b.count : 10;
+    const adjustedWait = Math.max(
+      2,
+      Math.round(baseWait * waitCapacityFactor + Math.min(6, liveInHour * 0.4))
+    );
+    return {
+      hour: b.hour,
+      hour24: b.hour24,
+      dailyFootfall,
+      liveTokensCount: liveInHour,
+      avgWaitMins: adjustedWait,
+    };
+  });
+
+  const maxDailyFootfall = Math.max(1, ...rawDailyHourly.map((h) => h.dailyFootfall));
+  const peakCutoff = Math.max(55 * targetFacilities.length, Math.round(maxDailyFootfall * 0.72));
+  const recCutoff = Math.round(maxDailyFootfall * 0.48);
+
+  const hourlyFootfall = rawDailyHourly.map((h, idx) => {
+    const isPeak = h.dailyFootfall >= peakCutoff;
+    const isRecommended = !isPeak && h.dailyFootfall <= recCutoff;
+    // Slight deterministic weekly/monthly day-pattern adjustment so charts stay informative
+    const periodVariance =
+      period === 'daily' ? 1 : period === 'weekly' ? 0.94 + ((idx % 3) * 0.05) : 0.96 + ((idx % 4) * 0.03);
+    const scaledFootfall = Math.round(h.dailyFootfall * periodScale * periodVariance);
+    const crowdLevel: CrowdLevel = isPeak
+      ? 'High'
+      : h.dailyFootfall >= Math.round(peakCutoff * 0.68)
+        ? 'Medium'
+        : 'Low';
+    return {
+      hour: h.hour,
+      hour24: h.hour24,
+      footfall: scaledFootfall,
+      liveTokensCount: h.liveTokensCount,
+      avgWaitMins: h.avgWaitMins,
+      isPeak,
+      isRecommended,
+      crowdLevel,
+    };
+  });
+
+  const dailyVisitors =
+    rawDailyHourly.reduce((sum, h) => sum + h.dailyFootfall, 0) +
+    Math.max(0, peopleInQueue - 5);
+  const weeklyVisitors = Math.round(dailyVisitors * 6.85);
+  const monthlyVisitors = Math.round(dailyVisitors * 26.2);
+
+  const busiestSlot = hourlyFootfall.reduce(
+    (best, cur) => (cur.footfall > best.footfall ? cur : best),
+    hourlyFootfall[0] || { hour: '11 AM', footfall: 0, avgWaitMins: 0 }
+  );
+
+  const peakSlots = hourlyFootfall.filter((h) => h.isPeak);
+  const nonPeakSlots = hourlyFootfall.filter((h) => !h.isPeak);
+  const peakAvgWaitMins =
+    peakSlots.length > 0
+      ? Math.round(peakSlots.reduce((s, p) => s + p.avgWaitMins, 0) / peakSlots.length)
+      : avgWaitTimeMins;
+  const nonPeakAvgWaitMins =
+    nonPeakSlots.length > 0
+      ? Math.round(nonPeakSlots.reduce((s, p) => s + p.avgWaitMins, 0) / nonPeakSlots.length)
+      : Math.max(4, Math.round(avgWaitTimeMins * 0.55));
+
+  // Surge alerts across scoped queues
+  const surgeAlerts = allHydratedQueues
+    .filter((q) => q.waitingCount >= surgeThreshold || q.predictedWaitMins >= 15)
+    .map((q) => {
+      const facCounters = scopedCounters.filter((c) => c.facilityId === q.facilityId);
+      const standby =
+        facCounters.find((c) => c.status === 'Closed' && c.queueId === q.id) ||
+        facCounters.find((c) => c.status === 'Closed' || c.status === 'Paused');
+      const lowLoadCounter = facCounters.find(
+        (c) =>
+          c.id !== standby?.id &&
+          c.queueId !== q.id &&
+          (c.status === 'Serving' || c.status === 'Busy')
+      );
+
+      const recommendation = standby
+        ? `Shift standby desk ${standby.label} (${standby.staffName}) to ${q.name} to cut wait time by ~45%.`
+        : lowLoadCounter
+          ? `Reassign ${lowLoadCounter.label} (${lowLoadCounter.staffName}) from low-load desk to assist ${q.name}.`
+          : `All facility counters active. Open a temporary overflow counter for ${q.name}.`;
+
+      return {
+        id: `surge-${q.facilityId}-${q.id}`,
+        facilityId: q.facilityId,
+        facilityName: q.facilityName,
+        queueId: q.id,
+        queueName: q.name,
+        departmentName: q.departmentName,
+        title: `High Crowd Detected – ${q.name}`,
+        waitingCount: q.waitingCount,
+        threshold: surgeThreshold,
+        predictedWaitMins: q.predictedWaitMins,
+        recommendation,
+        standbyCounterId: standby?.id || null,
+        standbyCounterLabel: standby?.label || null,
+        standbyStaffName: standby?.staffName || null,
+      };
+    });
+
+  // Counter Management hydrated list
+  const counters = scopedCounters.map((c) => {
+    const fac = targetFacilities.find((f) => f.id === c.facilityId);
+    const dept = db.departments.find((d) => d.id === c.departmentId);
+    const hq = allHydratedQueues.find((q) => q.id === c.queueId && q.facilityId === c.facilityId);
+    return {
+      id: c.id,
+      facilityId: c.facilityId,
+      facilityName: fac?.name || c.facilityId,
+      departmentId: c.departmentId,
+      departmentName: dept?.name || hq?.departmentName || 'General Services',
+      queueId: c.queueId,
+      queueName: hq?.name || 'General Queue',
+      label: c.label,
+      staffName: c.staffName,
+      assignedOperatorId: c.assignedOperatorId,
+      status: c.status,
+      currentToken: c.currentToken,
+      queueLength: hq?.waitingCount || 0,
+      estimatedWaitMins: c.status === 'Closed' ? hq?.predictedWaitMins || 0 : hq?.predictedWaitMins || 0,
+      avgCycleMins: c.avgCycleMins,
+    };
+  });
+
+  // Smart Queue Predictions per queue
+  const queuePredictions = allHydratedQueues.map((q) => {
+    const crowdLevel = classifyCrowdLevel(q.waitingCount, q.predictedWaitMins, surgeThreshold);
+    const overThreshold = q.waitingCount >= surgeThreshold || q.predictedWaitMins >= 15;
+    const approachingThreshold =
+      !overThreshold &&
+      (q.waitingCount >= Math.max(2, surgeThreshold - 2) || q.predictedWaitMins >= 10);
+
+    const standby = scopedCounters.find(
+      (c) => c.facilityId === q.facilityId && (c.status === 'Closed' || c.status === 'Paused')
+    );
+    const nextWaitEstimate =
+      q.activeCounters > 0
+        ? computeQueueWaitMins(q, q.waitingCount, q.activeCounters + 1)
+        : q.predictedWaitMins;
+
+    let suggestedAction = 'Optimal counter allocation';
+    if (overThreshold && standby) {
+      suggestedAction = `Open ${standby.label} (${standby.staffName}) to cut wait from ${q.predictedWaitMins}m to ~${nextWaitEstimate}m`;
+    } else if (overThreshold) {
+      suggestedAction = `High load: add overflow counter or reassign staff to ${q.name}`;
+    } else if (approachingThreshold) {
+      suggestedAction = `Approaching surge threshold (${q.waitingCount}/${surgeThreshold}); keep standby desk ready`;
+    }
+
+    return {
+      queueId: q.id,
+      queueName: q.name,
+      facilityId: q.facilityId,
+      facilityName: q.facilityName,
+      departmentName: q.departmentName,
+      waitingCount: q.waitingCount,
+      activeCounters: q.activeCounters,
+      avgServiceMinutes: q.avgServiceMinutes,
+      predictedWaitMins: q.predictedWaitMins,
+      crowdLevel,
+      approachingThreshold,
+      overThreshold,
+      confidence: q.predictionConfidence,
+      suggestedAction,
+      suggestedCounterId: (overThreshold || approachingThreshold) && standby ? standby.id : null,
+    };
+  });
+
+  // Upcoming Busy Hours predictions (historical pattern + current queue momentum)
+  const currentHour24 = new Date().getHours();
+  const upcomingCandidates = hourlyFootfall
+    .filter((h) => h.hour24 >= Math.min(14, currentHour24) || h.isPeak)
+    .sort((a, b) => b.footfall - a.footfall)
+    .slice(0, 4)
+    .sort((a, b) => a.hour24 - b.hour24);
+
+  const upcomingBusyHours = upcomingCandidates.map((slot) => {
+    const queuePressureBoost = Math.round(peopleInQueue * 0.35);
+    const expectedVisitors = slot.footfall + (period === 'daily' ? queuePressureBoost : 0);
+    const predictedWaitMins = slot.avgWaitMins + (surgeAlerts.length > 0 ? 3 : 0);
+    const crowdLevel: CrowdLevel = slot.isPeak
+      ? 'High'
+      : predictedWaitMins >= 12
+        ? 'Medium'
+        : 'Low';
+    const suggestedAction =
+      crowdLevel === 'High'
+        ? 'Open additional standby counter 15 mins prior'
+        : crowdLevel === 'Medium'
+          ? 'Monitor counter cycle times & enable pre-alerts'
+          : 'Normal staffing sufficient · ideal for follow-ups';
+
+    return {
+      hour: slot.hour,
+      expectedVisitors,
+      predictedWaitMins,
+      crowdLevel,
+      confidence: slot.isPeak ? 94 : 89,
+      suggestedAction,
+    };
+  });
+
+  // On-time SLA calculation
+  const baseOnTime = 96;
+  const overloadPenalty = surgeAlerts.length * 2;
+  const skipPenalty = Math.min(6, cancelledOrNoShow);
+  const counterBonus = activeCounters >= totalCounters && totalCounters > 0 ? 2 : 0;
+  const onTimeServiceRate = Math.max(
+    78,
+    Math.min(99, baseOnTime - overloadPenalty - skipPenalty + counterBonus)
+  );
+
+  // Sustainability & Social Impact
+  const digitalTokensServed =
+    db.metrics.basePaperSlipsSaved + db.metrics.processedDelta + completedTokensInStore;
+  const avgMinsSavedPerVisitor = Math.max(12, Math.round(peakAvgWaitMins * 0.72));
+  const estimatedTimeSavedMinutes =
+    (visitorsServedToday + peopleInQueue) * avgMinsSavedPerVisitor +
+    Math.round(db.metrics.processedDelta * 14);
+  const estimatedTimeSavedHours = Math.round(estimatedTimeSavedMinutes / 60);
+  const standbyOpenedCount = scopedCounters.filter(
+    (c) => c.id === 'c3' && (c.status === 'Serving' || c.status === 'Busy')
+  ).length;
+  const physicalWaitReductionPct = Math.min(
+    62,
+    41 + standbyOpenedCount * 5 + Math.min(8, Math.floor(db.metrics.processedDelta / 2))
+  );
+  const estimatedCrowdReductionPct = Math.min(58, 36 + standbyOpenedCount * 6 + activeCounters);
+  const corridorVisitorsAvoided = Math.round(
+    (visitorsServedToday + peopleInQueue) * (estimatedCrowdReductionPct / 100) +
+      db.metrics.processedDelta
+  );
+
+  return {
+    facilityId: scopeId,
+    facilityName:
+      scopeId === 'all'
+        ? 'All Organisation Service Centers'
+        : targetFacilities[0].name,
+    period,
+    surgeThreshold,
+    overviewCards: {
+      peopleInQueue,
+      avgServiceTimeMins,
+      avgWaitTimeMins,
+      activeCounters,
+      totalCounters,
+      onTimeServiceRate,
+      visitorsServedToday,
+    },
+    visitorStats: {
+      dailyVisitors,
+      weeklyVisitors,
+      monthlyVisitors,
+      busiestHour: busiestSlot.hour,
+      busiestHourVisitors: busiestSlot.footfall,
+      peakAvgWaitMins,
+      nonPeakAvgWaitMins,
+      peakHours: peakSlots.map((p) => p.hour),
+      recommendedHours: hourlyFootfall.filter((h) => h.isRecommended).map((h) => h.hour),
+    },
+    hourlyFootfall,
+    upcomingBusyHours,
+    surgeAlerts,
+    counters,
+    queuePredictions,
+    sustainabilityImpact: {
+      estimatedTimeSavedMinutes,
+      estimatedTimeSavedHours,
+      physicalWaitReductionPct,
+      digitalTokensServed,
+      estimatedCrowdReductionPct,
+      corridorVisitorsAvoided,
+      sdg9InfraCalls: db.metrics.baseInfraCalls + db.metrics.processedDelta,
+      sdg12PaperSlipsSaved: digitalTokensServed,
+    },
+    operators: db.users
+      .filter((u) => u.role === 'operator' && u.accountStatus === 'active')
+      .map((u) => ({
+        id: u.id,
+        name: u.name,
+        assignedFacilityId: u.assignedFacilityId,
+        assignedCounterId: u.assignedCounterId,
+      })),
+    availableQueues: scopedQueues.map((q) => ({
+      id: q.id,
+      facilityId: q.facilityId,
+      facilityName: targetFacilities.find((f) => f.id === q.facilityId)?.name || q.facilityId,
+      departmentId: q.departmentId,
+      name: q.name,
+    })),
+  };
+}
+
+export function reallocateCounterStaff(params: {
+  counterId: string;
+  targetQueueId?: string;
+  operatorId?: string;
+  staffName?: string;
+  status?: CounterRecord['status'];
+  actor: ActorInfo;
+}): { counter: CounterRecord; snapshot: FacilitySnapshot } {
+  const db = dbStore.getState();
+  const counter = db.counters.find((c) => c.id === params.counterId);
+  if (!counter) {
+    throw new Error(`Counter '${params.counterId}' not found.`);
+  }
+
+  if (params.targetQueueId) {
+    const q = db.queues.find(
+      (fq) => fq.id === params.targetQueueId && fq.facilityId === counter.facilityId
+    );
+    if (!q) {
+      throw new Error('Target service queue not found in the same facility.');
+    }
+    counter.queueId = q.id;
+    counter.departmentId = q.departmentId;
+    counter.avgCycleMins = q.avgServiceMinutes;
+    counter.currentToken = `${q.prefix}-${q.servingNumber}`;
+  }
+
+  if (params.operatorId !== undefined) {
+    const op = params.operatorId
+      ? db.users.find((u) => u.id === params.operatorId && u.role === 'operator')
+      : undefined;
+    if (op) {
+      counter.assignedOperatorId = op.id;
+      counter.staffName = op.name;
+      op.assignedFacilityId = counter.facilityId;
+      op.assignedDepartmentId = counter.departmentId;
+      op.assignedCounterId = counter.id;
+    } else if (params.staffName?.trim()) {
+      counter.assignedOperatorId = undefined;
+      counter.staffName = params.staffName.trim();
+    }
+  } else if (params.staffName?.trim()) {
+    counter.staffName = params.staffName.trim();
+  }
+
+  counter.status = params.status || 'Serving';
+
+  const queueObj = db.queues.find((q) => q.id === counter.queueId);
+  recordAuditLog({
+    actor: params.actor,
+    action: 'STAFF_REALLOCATED',
+    targetType: 'counter',
+    targetId: counter.id,
+    facilityId: counter.facilityId,
+    details: `Reallocated ${counter.label} (${counter.staffName}) to ${queueObj?.name || counter.queueId} as ${counter.status}.`,
+  });
+
+  pushNotification({
+    facilityId: counter.facilityId,
+    title: `Staff Reallocated · ${counter.label}`,
+    message: `${counter.staffName} assigned to ${queueObj?.name || 'service queue'} (${counter.status}).`,
+    category: 'system',
+  });
+
+  dbStore.save();
+  broadcastFacilitySnapshot(counter.facilityId, 'counter:updated', { counter });
+
+  return {
+    counter,
+    snapshot: getFacilitySnapshot(counter.facilityId)!,
+  };
+}
+
 export function getAnalyticsSummary(facilityId: string) {
   const db = dbStore.getState();
   const snapshot = getFacilitySnapshot(facilityId);
   if (!snapshot) return null;
 
-  const hourlyTraffic = db.hourlyTraffic[facilityId] || [];
+  const orgDash = getOrganisationAnalyticsDashboard({ facilityId, period: 'daily' });
+  const hourlyTraffic = orgDash
+    ? orgDash.hourlyFootfall.map((h) => ({
+        hour: h.hour,
+        footfall: h.footfall,
+        avgWaitMins: h.avgWaitMins,
+        isPeak: h.isPeak,
+        isRecommended: h.isRecommended,
+      }))
+    : db.hourlyTraffic[facilityId] || [];
+
   const peakHours = hourlyTraffic.filter((h) => h.isPeak).map((h) => h.hour);
   const recommendedHours = hourlyTraffic
     .filter((h) => h.isRecommended)
@@ -922,5 +1568,6 @@ export function getAnalyticsSummary(facilityId: string) {
       sdg11CorridorDensityReduction: standbyOpened ? '-46%' : '-41%',
       sdg12PaperSlipsSaved: db.metrics.basePaperSlipsSaved + db.metrics.processedDelta,
     },
+    organisationDashboard: orgDash,
   };
 }

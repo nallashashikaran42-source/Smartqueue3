@@ -29,6 +29,7 @@ const OPERATOR_SECTIONS: OperatorSection[] = [
 
 const ADMIN_SECTIONS: AdminSection[] = [
   'overview',
+  'peak-analytics',
   'users',
   'centers',
   'departments',

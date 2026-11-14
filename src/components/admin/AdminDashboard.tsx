@@ -16,6 +16,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   ShieldAlert,
+  TrendingUp,
 } from 'lucide-react';
 import {
   api,
@@ -37,9 +38,11 @@ import { useQueueSocket, type QueueWsMessage } from '../../hooks/useQueueSocket'
 import { DashboardShell, type SidebarNavItem } from '../DashboardShell';
 import { NotificationsView } from '../NotificationsView';
 import { ProfileView } from '../ProfileView';
+import { PeakHoursOrgDashboard } from './PeakHoursOrgDashboard';
 
 export type AdminSection =
   | 'overview'
+  | 'peak-analytics'
   | 'users'
   | 'centers'
   | 'departments'
@@ -90,6 +93,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [auditLogs, setAuditLogs] = useState<AuditLogItem[]>([]);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
+  const [analyticsRefreshKey, setAnalyticsRefreshKey] = useState(0);
   const [loading, setLoading] = useState(true);
 
   // Filters
@@ -229,6 +233,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       }
 
       loadOverviewAndNotifs();
+      setAnalyticsRefreshKey((k) => k + 1);
       if (section === 'queues') loadMonitor();
       if (section === 'reports') loadReports();
     },
@@ -531,6 +536,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   const navItems: SidebarNavItem[] = [
     { id: 'overview', label: 'Overview', icon: <LayoutDashboard className="w-4 h-4" /> },
+    {
+      id: 'peak-analytics',
+      label: 'Peak Hours & Org',
+      icon: <TrendingUp className="w-4 h-4" />,
+      badge: overview?.centersSummary.filter((c) => c.hasSurge).length || undefined,
+    },
     { id: 'users', label: 'User Management', icon: <Users className="w-4 h-4" /> },
     { id: 'centers', label: 'Service Centers', icon: <Building2 className="w-4 h-4" /> },
     { id: 'departments', label: 'Departments', icon: <FolderTree className="w-4 h-4" /> },
@@ -598,14 +609,24 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     Live cross-center telemetry, active staffing, and platform queue throughput.
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => onNavigate('reports')}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 bg-white hover:bg-slate-50 border border-slate-200 text-slate-800 rounded-lg text-xs font-semibold cursor-pointer"
-                >
-                  <BarChart3 className="w-4 h-4 text-blue-600" />
-                  <span>Full Analytics &amp; Export</span>
-                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => onNavigate('peak-analytics')}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 bg-teal-600 hover:bg-teal-700 text-white rounded-lg text-xs font-semibold cursor-pointer whitespace-nowrap"
+                  >
+                    <TrendingUp className="w-4 h-4" />
+                    <span>Peak Hours &amp; Org Dashboard</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onNavigate('reports')}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 bg-white hover:bg-slate-50 border border-slate-200 text-slate-800 rounded-lg text-xs font-semibold cursor-pointer whitespace-nowrap"
+                  >
+                    <BarChart3 className="w-4 h-4 text-blue-600" />
+                    <span>Full Analytics &amp; Export</span>
+                  </button>
+                </div>
               </div>
 
               {/* 10 Platform KPIs */}
@@ -742,6 +763,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 </section>
               </div>
             </div>
+          )}
+
+          {/* 1B. PEAK HOURS ANALYTICS & SMART ORGANISATION DASHBOARD */}
+          {section === 'peak-analytics' && (
+            <PeakHoursOrgDashboard
+              facilities={facilities}
+              refreshKey={analyticsRefreshKey}
+              onMutated={async () => {
+                await Promise.all([loadOverviewAndNotifs(), loadMonitor(), loadReports()]);
+              }}
+              onToast={onToast}
+            />
           )}
 
           {/* 2. USER MANAGEMENT */}
