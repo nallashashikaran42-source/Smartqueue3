@@ -566,7 +566,10 @@ export const OperatorDashboard: React.FC<OperatorDashboardProps> = ({
                               </span>
                             </div>
                             <div className="text-xs text-slate-600 truncate mt-0.5">
-                              {item.citizenLabel} · Joined {item.joinedAt}
+                              {item.citizenLabel} ·{' '}
+                              {item.appointmentSlot
+                                ? `Slot ${item.appointmentSlot} (${item.appointmentDate || 'Today'})`
+                                : `Joined ${item.joinedAt}`}
                             </div>
                           </div>
                           <div className="text-right font-mono tabular-nums text-xs text-slate-500 shrink-0">
@@ -658,7 +661,16 @@ export const OperatorDashboard: React.FC<OperatorDashboardProps> = ({
                             </td>
                             <td className="py-3.5 px-4 text-xs text-slate-700">{item.queueName}</td>
                             <td className="py-3.5 px-4 font-mono text-xs text-slate-600">
-                              {item.joinedAt}
+                              {item.appointmentSlot ? (
+                                <div>
+                                  <div className="font-semibold text-teal-800">{item.appointmentSlot}</div>
+                                  <div className="text-[10px] text-slate-500">
+                                    {item.appointmentDate || item.joinedAt}
+                                  </div>
+                                </div>
+                              ) : (
+                                item.joinedAt
+                              )}
                             </td>
                             <td className="py-3.5 px-4 font-mono tabular-nums text-xs text-slate-700">
                               {item.waitMinsSoFar} min

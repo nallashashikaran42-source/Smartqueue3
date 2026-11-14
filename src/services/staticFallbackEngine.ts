@@ -1316,6 +1316,8 @@ export async function handleStaticApiRequest<T>(
           priority: t.priority,
           status: t.status,
           joinedAt: t.joinedAt,
+          appointmentDate: t.appointmentDate,
+          appointmentSlot: t.appointmentSlot,
           calledAt: t.calledAt,
           completedAt: t.completedAt,
           cancelledAt: t.cancelledAt,
@@ -1333,11 +1335,90 @@ export async function handleStaticApiRequest<T>(
     return snap as T;
   }
 
+  const queueSlotsMatch = path.match(/^\/api\/queues\/([^/]+)\/slots$/);
+  if (queueSlotsMatch && method === 'GET') {
+    const facilityId = decodeURIComponent(queueSlotsMatch[1]);
+    const queueId = parsedUrl.searchParams.get('queueId') || '';
+    const dateParam = parsedUrl.searchParams.get('date') || '';
+    const targetDate = /^\d{4}-\d{2}-\d{2}$/.test(dateParam)
+      ? dateParam
+      : new Date().toISOString().slice(0, 10);
+    const facility = db.facilities.find((f) => f.id === facilityId);
+    const queue = db.queues.find((q) => q.id === queueId && q.facilityId === facilityId);
+    if (!facility || !queue) throw new StaticApiHttpError('Queue not found.', 404);
+
+    const activeCntForQueue = Math.max(
+      1,
+      db.counters.filter((c) => c.facilityId === facilityId && c.queueId === queue.id && c.status !== 'Closed').length
+    );
+    const maxCapacity = Math.min(
+      12,
+      Math.max(4, Math.floor(30 / Math.max(2, queue.avgServiceMinutes)) * activeCntForQueue)
+    );
+    const templates = [
+      { slot: '08:00 AM', hourLabel: '8 AM' },
+      { slot: '08:30 AM', hourLabel: '8 AM' },
+      { slot: '09:00 AM', hourLabel: '9 AM' },
+      { slot: '09:30 AM', hourLabel: '9 AM' },
+      { slot: '10:00 AM', hourLabel: '10 AM' },
+      { slot: '10:30 AM', hourLabel: '10 AM' },
+      { slot: '11:00 AM', hourLabel: '11 AM' },
+      { slot: '11:30 AM', hourLabel: '11 AM' },
+      { slot: '12:00 PM', hourLabel: '12 PM' },
+      { slot: '01:00 PM', hourLabel: '1 PM' },
+      { slot: '01:30 PM', hourLabel: '1 PM' },
+      { slot: '02:00 PM', hourLabel: '2 PM' },
+      { slot: '02:30 PM', hourLabel: '2 PM' },
+      { slot: '03:00 PM', hourLabel: '3 PM' },
+      { slot: '03:30 PM', hourLabel: '3 PM' },
+      { slot: '04:00 PM', hourLabel: '4 PM' },
+      { slot: '04:30 PM', hourLabel: '4 PM' },
+    ];
+    const hourTrafficMap = new Map((db.hourlyTraffic[facilityId] || []).map((h) => [h.hour, h]));
+    const slots = templates.map((tpl) => {
+      const bookedCount = db.tokens.filter(
+        (t) =>
+          t.facilityId === facilityId &&
+          t.queueId === queue.id &&
+          t.appointmentSlot === tpl.slot &&
+          (t.appointmentDate || targetDate) === targetDate &&
+          !['Cancelled', 'Skipped', 'NoShow', 'Completed'].includes(t.status)
+      ).length;
+      const remainingSpots = Math.max(0, maxCapacity - bookedCount);
+      const hrMeta = hourTrafficMap.get(tpl.hourLabel);
+      const isPeak = Boolean(hrMeta?.isPeak ?? (tpl.hourLabel === '10 AM' || tpl.hourLabel === '11 AM'));
+      const isBestTime = Boolean(hrMeta?.isRecommended ?? (!isPeak && (tpl.hourLabel === '8 AM' || tpl.hourLabel === '1 PM' || tpl.hourLabel === '2 PM' || tpl.hourLabel === '3 PM')));
+      const crowdLevel: CrowdLevel = isPeak ? 'High' : isBestTime ? 'Low' : 'Medium';
+      const baseWait = hrMeta?.avgWaitMins ?? (isPeak ? 22 : isBestTime ? 8 : 13);
+      return {
+        slot: tpl.slot,
+        hourLabel: tpl.hourLabel,
+        bookedCount,
+        maxCapacity,
+        remainingSpots,
+        isAvailable: remainingSpots > 0,
+        crowdLevel,
+        isBestTime,
+        isPeak,
+        estimatedWaitMins: Math.max(2, Math.round(baseWait * 0.65 + bookedCount * 1.8)),
+      };
+    });
+    return { facilityId, queueId: queue.id, queueName: queue.name, date: targetDate, slots } as T;
+  }
+
   const issueTokenMatch = path.match(/^\/api\/queues\/([^/]+)\/tokens$/);
   if (issueTokenMatch && method === 'POST') {
     const facilityId = decodeURIComponent(issueTokenMatch[1]);
     const queueId = String(body.queueId || '');
     const channel = (body.channel as EntryChannel) || 'App QR';
+    const appointmentSlot = typeof body.appointmentSlot === 'string' && body.appointmentSlot.trim()
+      ? body.appointmentSlot.trim()
+      : undefined;
+    const rawDate = typeof body.appointmentDate === 'string' ? body.appointmentDate.trim() : '';
+    const appointmentDate = appointmentSlot || (rawDate && /^\d{4}-\d{2}-\d{2}$/.test(rawDate))
+      ? (/^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? rawDate : new Date().toISOString().slice(0, 10))
+      : undefined;
+
     const facility = db.facilities.find((f) => f.id === facilityId && f.isActive);
     const queue = db.queues.find((q) => q.id === queueId && q.facilityId === facilityId && q.isActive);
     if (!facility || !queue) throw new StaticApiHttpError('Service queue not found.', 400);
@@ -1374,6 +1455,8 @@ export async function handleStaticApiRequest<T>(
       priority: queue.priority,
       status: 'Waiting',
       joinedAt: formatNowTime(),
+      appointmentDate,
+      appointmentSlot,
       aheadCount: 0,
       etaMinutes: 0,
       createdAtMs: Date.now(),
@@ -1384,8 +1467,10 @@ export async function handleStaticApiRequest<T>(
       facilityId,
       userId: user.id,
       tokenId,
-      title: `Token ${tokenId} Confirmed`,
-      message: `Reserved in ${queue.name} (${queue.location}) at ${facility.name} via ${channel}.`,
+      title: appointmentSlot ? `Pre-Booked ${tokenId} · ${appointmentSlot}` : `Token ${tokenId} Confirmed`,
+      message: appointmentSlot
+        ? `Reserved in ${queue.name} for ${appointmentDate} at ${appointmentSlot} (${queue.location}) at ${facility.name} via ${channel}.`
+        : `Reserved in ${queue.name} (${queue.location}) at ${facility.name} via ${channel}.`,
       category: 'token',
     });
     saveDb(db);
@@ -1539,6 +1624,8 @@ export async function handleStaticApiRequest<T>(
           priority: t.priority,
           status: t.status,
           joinedAt: t.joinedAt,
+          appointmentDate: storedTok?.appointmentDate,
+          appointmentSlot: storedTok?.appointmentSlot,
           calledAt: t.calledAt,
           servingStartedAt: t.servingStartedAt,
           etaMinutes: t.etaMinutes,

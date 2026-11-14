@@ -105,6 +105,8 @@ operatorRoutes.get('/workspace', (req, res) => {
       priority: t.priority,
       status: t.status,
       joinedAt: t.joinedAt,
+      appointmentDate: t.appointmentDate,
+      appointmentSlot: t.appointmentSlot,
       calledAt: t.calledAt,
       servingStartedAt: t.servingStartedAt,
       etaMinutes: t.etaMinutes,

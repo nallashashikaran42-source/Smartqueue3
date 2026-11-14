@@ -135,6 +135,8 @@ export interface ApiTokenRecord {
   priority: QueuePriority;
   status: TokenStatus;
   joinedAt: string;
+  appointmentDate?: string;
+  appointmentSlot?: string;
   calledAt?: string;
   servingStartedAt?: string;
   completedAt?: string;
@@ -203,6 +205,8 @@ export interface CitizenHistoryItem {
   priority: QueuePriority;
   status: TokenStatus;
   joinedAt: string;
+  appointmentDate?: string;
+  appointmentSlot?: string;
   calledAt?: string;
   completedAt?: string;
   cancelledAt?: string;
@@ -218,6 +222,8 @@ export interface OperatorLiveQueueItem {
   priority: QueuePriority;
   status: TokenStatus;
   joinedAt: string;
+  appointmentDate?: string;
+  appointmentSlot?: string;
   calledAt?: string;
   servingStartedAt?: string;
   etaMinutes: number;
@@ -392,6 +398,27 @@ export interface AnalyticsSummaryResponse {
 }
 
 export type CrowdLevel = 'Low' | 'Medium' | 'High';
+
+export interface AppointmentSlotItem {
+  slot: string;
+  hourLabel: string;
+  bookedCount: number;
+  maxCapacity: number;
+  remainingSpots: number;
+  isAvailable: boolean;
+  crowdLevel: CrowdLevel;
+  isBestTime: boolean;
+  isPeak: boolean;
+  estimatedWaitMins: number;
+}
+
+export interface AppointmentSlotsResponse {
+  facilityId: string;
+  queueId: string;
+  queueName: string;
+  date: string;
+  slots: AppointmentSlotItem[];
+}
 
 export interface OrganisationAnalyticsDashboardResponse {
   facilityId: string;
@@ -805,9 +832,27 @@ export const api = {
     return apiRequest(`/api/queues/${encodeURIComponent(facilityId)}/state`);
   },
 
+  async getQueueAppointmentSlots(
+    facilityId: string,
+    queueId: string,
+    date?: string
+  ): Promise<AppointmentSlotsResponse> {
+    const qs = new URLSearchParams({ queueId });
+    if (date) qs.set('date', date);
+    return apiRequest(
+      `/api/queues/${encodeURIComponent(facilityId)}/slots?${qs.toString()}`
+    );
+  },
+
   async issueToken(
     facilityId: string,
-    body: { queueId: string; channel: EntryChannel; citizenName?: string }
+    body: {
+      queueId: string;
+      channel: EntryChannel;
+      citizenName?: string;
+      appointmentDate?: string;
+      appointmentSlot?: string;
+    }
   ): Promise<{ token: ApiTokenRecord; snapshot: FacilitySnapshotResponse }> {
     return apiRequest(`/api/queues/${encodeURIComponent(facilityId)}/tokens`, {
       method: 'POST',

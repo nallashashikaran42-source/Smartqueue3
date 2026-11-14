@@ -10,6 +10,7 @@ import {
   cancelToken,
   checkInGraceSlot,
   createSwapRequest,
+  getAppointmentSlots,
   getFacilitySnapshot,
   issueToken,
 } from '../services/queueEngine.ts';
@@ -27,13 +28,34 @@ queueRoutes.get('/:facilityId/state', requireAuth, (req, res) => {
   res.json(snapshot);
 });
 
-// Issue a digital token (App QR, Missed Call, SMS, Audio Kiosk)
+// Get available pre-booking time slots for a service queue & date
+queueRoutes.get('/:facilityId/slots', requireAuth, (req, res) => {
+  const { facilityId } = req.params;
+  const queueId = (req.query.queueId as string) || '';
+  const date = req.query.date as string | undefined;
+
+  if (!queueId) {
+    res.status(400).json({ error: 'queueId query parameter is required.' });
+    return;
+  }
+
+  const slots = getAppointmentSlots({ facilityId, queueId, date });
+  if (!slots) {
+    res.status(404).json({ error: `Queue '${queueId}' in facility '${facilityId}' not found.` });
+    return;
+  }
+  res.json(slots);
+});
+
+// Issue a digital token (App QR, Missed Call, SMS, Audio Kiosk) with optional pre-booked appointment time
 queueRoutes.post('/:facilityId/tokens', requireAuth, (req, res) => {
   const { facilityId } = req.params;
-  const { queueId, channel, citizenName } = req.body as {
+  const { queueId, channel, citizenName, appointmentDate, appointmentSlot } = req.body as {
     queueId?: string;
     channel?: EntryChannel;
     citizenName?: string;
+    appointmentDate?: string;
+    appointmentSlot?: string;
   };
 
   if (!queueId) {
@@ -51,6 +73,8 @@ queueRoutes.post('/:facilityId/tokens', requireAuth, (req, res) => {
       channel: channel || 'App QR',
       citizenName: citizenName || user?.name,
       userId: req.authUser?.sub,
+      appointmentDate,
+      appointmentSlot,
     });
     broadcastFacilitySnapshot(facilityId, 'token:issued', { token: result.token });
     res.status(201).json(result);

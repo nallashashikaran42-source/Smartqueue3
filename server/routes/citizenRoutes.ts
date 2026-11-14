@@ -76,6 +76,8 @@ citizenRoutes.get('/history', requireAuth, (req, res) => {
         priority: t.priority,
         status: t.status,
         joinedAt: t.joinedAt,
+        appointmentDate: t.appointmentDate,
+        appointmentSlot: t.appointmentSlot,
         calledAt: t.calledAt,
         completedAt: t.completedAt,
         cancelledAt: t.cancelledAt,

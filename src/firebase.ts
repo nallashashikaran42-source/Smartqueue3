@@ -207,6 +207,13 @@ export async function syncTicketToFirestore(
     const existingSnap = await getDoc(ticketRef);
     if (!existingSnap.exists()) {
       if (token.status !== 'Waiting') return;
+      const displayJoinedOrSlot = token.appointmentSlot
+        ? sanitizeString(
+            `${token.appointmentDate || ''} · ${token.appointmentSlot}`.replace(/^\s*·\s*/, ''),
+            64,
+            token.joinedAt
+          )
+        : sanitizeString(token.joinedAt, 64, 'Just now');
       await setDoc(ticketRef, {
         tokenId: sanitizeString(token.tokenId, 64),
         uid,
@@ -215,7 +222,7 @@ export async function syncTicketToFirestore(
         queueId: sanitizeString(token.queueId, 64),
         queueName: sanitizeString(token.queueName, 120, 'Queue'),
         status: token.status,
-        joinedAt: sanitizeString(token.joinedAt, 64, 'Just now'),
+        joinedAt: displayJoinedOrSlot,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });

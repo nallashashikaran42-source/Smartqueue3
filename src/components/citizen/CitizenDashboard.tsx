@@ -15,11 +15,13 @@ import {
   X,
   ArrowRight,
   Building2,
+  CalendarClock,
 } from 'lucide-react';
 import {
   api,
   type AnalyticsSummaryResponse,
   type ApiTokenRecord,
+  type AppointmentSlotsResponse,
   type AuthUser,
   type CitizenHistoryItem,
   type CitizenOverviewResponse,
@@ -70,6 +72,13 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
   const [snapshot, setSnapshot] = useState<FacilitySnapshotResponse | null>(null);
   const [analyticsSummary, setAnalyticsSummary] = useState<AnalyticsSummaryResponse | null>(null);
   const [analyticsLoading, setAnalyticsLoading] = useState(false);
+  const [bookingMode, setBookingMode] = useState<'walkin' | 'prebook'>('walkin');
+  const [appointmentDate, setAppointmentDate] = useState<string>(() =>
+    new Date().toISOString().slice(0, 10)
+  );
+  const [appointmentSlot, setAppointmentSlot] = useState<string>('');
+  const [slotsData, setSlotsData] = useState<AppointmentSlotsResponse | null>(null);
+  const [slotsLoading, setSlotsLoading] = useState(false);
   const [activeToken, setActiveToken] = useState<ApiTokenRecord | null>(null);
   const [history, setHistory] = useState<CitizenHistoryItem[]>([]);
   const [historyFilter, setHistoryFilter] = useState<'all' | 'Completed' | 'Cancelled'>('all');
@@ -79,6 +88,21 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
   const [selectedActivityId, setSelectedActivityId] = useState<string | null>(null);
   const [issuing, setIssuing] = useState(false);
   const [loading, setLoading] = useState(true);
+
+  const dateChoices = useMemo(() => {
+    const today = new Date();
+    return [0, 1, 2].map((offset) => {
+      const d = new Date(today.getTime() + offset * 86400000);
+      const iso = d.toISOString().slice(0, 10);
+      const label =
+        offset === 0
+          ? 'Today'
+          : offset === 1
+            ? 'Tomorrow'
+            : d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+      return { iso, label };
+    });
+  }, []);
 
   const loadAll = useCallback(async () => {
     try {
@@ -219,6 +243,50 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
     filteredQueuesForBooking[0] ??
     facilityQueues[0];
 
+  const isPrebookActive = chosenQueue?.priority === 'appointment' || bookingMode === 'prebook';
+
+  useEffect(() => {
+    if (chosenQueue?.priority === 'appointment') {
+      setBookingMode('prebook');
+    }
+  }, [chosenQueue?.id, chosenQueue?.priority]);
+
+  useEffect(() => {
+    if (!selectedFacilityId || !chosenQueue?.id || !isPrebookActive) {
+      return;
+    }
+    let active = true;
+    setSlotsLoading(true);
+    api
+      .getQueueAppointmentSlots(selectedFacilityId, chosenQueue.id, appointmentDate)
+      .then((res) => {
+        if (!active) return;
+        setSlotsData(res);
+        setAppointmentSlot((prev) => {
+          if (prev && res.slots.some((s) => s.slot === prev && s.isAvailable)) {
+            return prev;
+          }
+          const bestAvail = res.slots.find((s) => s.isBestTime && s.isAvailable);
+          const firstAvail = res.slots.find((s) => s.isAvailable);
+          return bestAvail?.slot || firstAvail?.slot || '';
+        });
+      })
+      .catch(() => {
+        if (active) setSlotsData(null);
+      })
+      .finally(() => {
+        if (active) setSlotsLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedFacilityId, chosenQueue?.id, appointmentDate, isPrebookActive, snapshot]);
+
+  const selectedSlotMeta = useMemo(() => {
+    if (!isPrebookActive || !slotsData) return null;
+    return slotsData.slots.find((s) => s.slot === appointmentSlot) || null;
+  }, [isPrebookActive, slotsData, appointmentSlot]);
+
   const availableCountersForChosenQueue = useMemo(() => {
     if (!chosenQueue) return [];
     return facilityCounters.filter((c) => c.queueId === chosenQueue.id && c.status !== 'Closed');
@@ -226,12 +294,18 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
 
   const handleIssueToken = async () => {
     if (!currentCenter || !chosenQueue) return;
+    if (isPrebookActive && !appointmentSlot) {
+      onToast('Please choose an appointment time slot before confirming.');
+      return;
+    }
     setIssuing(true);
     try {
       const res = await api.issueToken(currentCenter.facility.id, {
         queueId: chosenQueue.id,
         channel: selectedChannel,
         citizenName: user.name,
+        appointmentDate: isPrebookActive ? appointmentDate : undefined,
+        appointmentSlot: isPrebookActive ? appointmentSlot : undefined,
       });
       setSnapshot(res.snapshot);
       setActiveToken(res.token);
@@ -242,7 +316,11 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
           currentCenter.facility.name
         ).catch(() => undefined);
       }
-      onToast(`Token ${res.token.tokenId} booked successfully`);
+      onToast(
+        res.token.appointmentSlot
+          ? `Pre-booked ${res.token.tokenId} for ${res.token.appointmentDate} at ${res.token.appointmentSlot}`
+          : `Token ${res.token.tokenId} booked successfully`
+      );
       await loadAll();
       onNavigate('my-queue');
     } catch (err) {
@@ -451,6 +529,12 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                         <div className="text-xs text-slate-300 mt-1">
                           {activeToken.queueName} · {activeToken.counterLabel || 'Counter Assigned'}
                         </div>
+                        {activeToken.appointmentSlot && (
+                          <div className="text-xs font-mono text-teal-300 font-semibold mt-1">
+                            Scheduled: {activeToken.appointmentDate || 'Today'} ·{' '}
+                            {activeToken.appointmentSlot}
+                          </div>
+                        )}
                       </div>
                       <span className="font-mono text-xs uppercase text-emerald-300 font-semibold">
                         {activeToken.status}
@@ -518,7 +602,17 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                 }}
                 summary={analyticsSummary}
                 loading={analyticsLoading}
-                onBookAtFacility={() => onNavigate('take-token')}
+                onBookAtFacility={() => {
+                  const apptQueue = facilityQueues.find(
+                    (q) => q.isActive && !q.isPaused && q.priority === 'appointment'
+                  );
+                  if (apptQueue) {
+                    setSelectedDeptId('all');
+                    setSelectedQueueId(apptQueue.id);
+                  }
+                  setBookingMode('prebook');
+                  onNavigate('take-token');
+                }}
               />
 
               {/* Available Hospitals / Service Centers */}
@@ -736,9 +830,147 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                       })}
                     </div>
                   </div>
+
+                  {/* Step 4: Walk-In vs Pre-Booked Appointment Time Slot */}
+                  <div className="pt-4 border-t border-slate-100 space-y-4">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
+                          <CalendarClock className="w-3.5 h-3.5 text-teal-700" />
+                          <span>4. Visit Timing &amp; Pre-Booking Time Slot</span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 mt-0.5">
+                          {chosenQueue?.priority === 'appointment'
+                            ? 'Pre-booked queue requires choosing your preferred appointment date and time window.'
+                            : 'Join the live queue right away or reserve a specific appointment time slot.'}
+                        </p>
+                      </div>
+
+                      {chosenQueue?.priority !== 'appointment' && (
+                        <div className="inline-flex p-1 bg-slate-100 rounded-lg self-start">
+                          <button
+                            type="button"
+                            onClick={() => setBookingMode('walkin')}
+                            className={`px-3 py-1.5 text-xs font-semibold rounded-md cursor-pointer whitespace-nowrap ${
+                              bookingMode === 'walkin'
+                                ? 'bg-white text-slate-900 shadow-xs'
+                                : 'text-slate-600 hover:text-slate-900'
+                            }`}
+                          >
+                            Walk-In Now
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setBookingMode('prebook')}
+                            className={`px-3 py-1.5 text-xs font-semibold rounded-md cursor-pointer whitespace-nowrap ${
+                              bookingMode === 'prebook'
+                                ? 'bg-white text-teal-800 shadow-xs'
+                                : 'text-slate-600 hover:text-slate-900'
+                            }`}
+                          >
+                            Pre-Book Time Slot
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    {isPrebookActive && (
+                      <div className="space-y-4">
+                        {/* Date Selection */}
+                        <div className="flex flex-wrap items-center gap-2">
+                          {dateChoices.map((dc) => (
+                            <button
+                              key={dc.iso}
+                              type="button"
+                              onClick={() => setAppointmentDate(dc.iso)}
+                              className={`px-3 py-1.5 text-xs font-semibold rounded-lg border transition-colors cursor-pointer ${
+                                appointmentDate === dc.iso
+                                  ? 'bg-slate-900 text-white border-slate-900'
+                                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                              }`}
+                            >
+                              {dc.label}
+                            </button>
+                          ))}
+                          <input
+                            type="date"
+                            aria-label="Custom appointment date"
+                            min={dateChoices[0]?.iso}
+                            value={appointmentDate}
+                            onChange={(e) => {
+                              if (e.target.value) setAppointmentDate(e.target.value);
+                            }}
+                            className="px-2.5 py-1.5 text-xs font-mono bg-white border border-slate-300 rounded-lg text-slate-700 focus:outline-none focus:border-blue-600"
+                          />
+                        </div>
+
+                        {/* Time Slot Grid */}
+                        {slotsLoading && !slotsData ? (
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                            {Array.from({ length: 8 }).map((_, idx) => (
+                              <div
+                                key={idx}
+                                className="h-14 bg-slate-100 rounded-lg animate-pulse"
+                              />
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
+                            {(slotsData?.slots ?? []).map((slotItem) => {
+                              const isSelected = appointmentSlot === slotItem.slot;
+                              return (
+                                <button
+                                  key={slotItem.slot}
+                                  type="button"
+                                  disabled={!slotItem.isAvailable}
+                                  onClick={() => setAppointmentSlot(slotItem.slot)}
+                                  className={`text-left px-3 py-2.5 rounded-lg border transition-colors cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed ${
+                                    isSelected
+                                      ? 'border-blue-600 bg-blue-50 text-slate-900 ring-1 ring-blue-600'
+                                      : slotItem.isBestTime
+                                        ? 'border-teal-200 bg-teal-50/40 hover:border-teal-400 text-slate-900'
+                                        : 'border-slate-200 bg-white hover:border-slate-300 text-slate-900'
+                                  }`}
+                                >
+                                  <div className="flex items-center justify-between gap-1">
+                                    <span className="font-mono tabular-nums text-xs font-bold">
+                                      {slotItem.slot}
+                                    </span>
+                                    <span
+                                      className={`text-[10px] font-semibold ${
+                                        !slotItem.isAvailable
+                                          ? 'text-red-700'
+                                          : slotItem.isBestTime
+                                            ? 'text-teal-700'
+                                            : slotItem.isPeak
+                                              ? 'text-amber-700'
+                                              : 'text-slate-500'
+                                      }`}
+                                    >
+                                      {!slotItem.isAvailable
+                                        ? 'Full'
+                                        : slotItem.isBestTime
+                                          ? 'Best'
+                                          : slotItem.isPeak
+                                            ? 'Peak'
+                                            : 'Open'}
+                                    </span>
+                                  </div>
+                                  <div className="flex items-center justify-between text-[10px] text-slate-500 mt-1 font-mono tabular-nums">
+                                    <span>~{slotItem.estimatedWaitMins}m wait</span>
+                                    <span>{slotItem.remainingSpots} left</span>
+                                  </div>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
 
-                {/* Step 4: Counters Preview + Channel + Confirm */}
+                {/* Step 5: Counters Preview + Channel + Confirm */}
                 <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-5">
                   <div>
                     <div className="text-xs font-semibold uppercase tracking-wider text-blue-600">
@@ -805,17 +1037,45 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                     </div>
                   </div>
 
+                  {isPrebookActive && (
+                    <div className="p-3.5 bg-teal-50/70 border border-teal-200 rounded-lg space-y-1">
+                      <div className="text-[11px] font-semibold text-teal-800">
+                        Selected Pre-Booking Schedule
+                      </div>
+                      <div className="font-mono tabular-nums text-sm font-bold text-slate-900">
+                        {appointmentDate} · {appointmentSlot || 'Choose a time slot'}
+                      </div>
+                      {selectedSlotMeta && (
+                        <div className="text-[11px] text-slate-600">
+                          {selectedSlotMeta.isBestTime
+                            ? 'Recommended low-crowd slot'
+                            : selectedSlotMeta.isPeak
+                              ? 'Peak hour slot'
+                              : 'Standard crowd slot'}{' '}
+                          · ~{selectedSlotMeta.estimatedWaitMins} min est. counter wait
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   <button
                     type="button"
-                    disabled={issuing || !chosenQueue || Boolean(activeToken)}
+                    disabled={
+                      issuing ||
+                      !chosenQueue ||
+                      Boolean(activeToken) ||
+                      (isPrebookActive && !appointmentSlot)
+                    }
                     onClick={handleIssueToken}
                     className="w-full py-3 min-h-[44px] bg-blue-600 hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 text-white text-sm font-semibold rounded-lg transition-colors cursor-pointer disabled:cursor-not-allowed"
                   >
                     {issuing
-                      ? 'Generating Token...'
+                      ? 'Confirming Reservation...'
                       : activeToken
                         ? 'Active Token Already Exists'
-                        : 'Generate Digital Token'}
+                        : isPrebookActive
+                          ? `Confirm Pre-Booking${appointmentSlot ? ` · ${appointmentSlot}` : ''}`
+                          : 'Generate Digital Token'}
                   </button>
                 </div>
               </div>
@@ -931,6 +1191,12 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                             <div className="text-xs text-emerald-300 font-semibold mt-2">
                               Status: {activeToken.status}
                             </div>
+                            {activeToken.appointmentSlot && (
+                              <div className="text-xs font-mono text-teal-300 font-semibold mt-1">
+                                Appointment: {activeToken.appointmentDate || 'Today'} ·{' '}
+                                {activeToken.appointmentSlot}
+                              </div>
+                            )}
                           </div>
                           <div className="p-2 bg-white rounded-lg shrink-0">
                             <QrTicketSvg
@@ -988,7 +1254,11 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                           />
                         </div>
                         <div className="flex items-center justify-between text-xs text-slate-500 mt-2">
-                          <span>Joined at {activeToken.joinedAt}</span>
+                          <span>
+                            {activeToken.appointmentSlot
+                              ? `Slot: ${activeToken.appointmentDate || 'Today'} · ${activeToken.appointmentSlot}`
+                              : `Joined at ${activeToken.joinedAt}`}
+                          </span>
                           <span>Counter: {activeToken.counterLabel || 'Auto-assigned'}</span>
                         </div>
                       </section>
@@ -1176,7 +1446,16 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                               <div className="text-slate-500">{item.departmentName}</div>
                             </td>
                             <td className="py-3 px-4 font-mono tabular-nums text-slate-600">
-                              {item.joinedAt}
+                              {item.appointmentSlot ? (
+                                <div>
+                                  <div className="font-semibold text-teal-800">{item.appointmentSlot}</div>
+                                  <div className="text-[11px] text-slate-500">
+                                    {item.appointmentDate || item.joinedAt}
+                                  </div>
+                                </div>
+                              ) : (
+                                item.joinedAt
+                              )}
                             </td>
                             <td className="py-3 px-4 font-mono tabular-nums text-slate-600">
                               {item.completedAt || item.cancelledAt || '—'}

@@ -137,6 +137,8 @@ export interface TokenRecord {
   priority: QueuePriority;
   status: TokenStatus;
   joinedAt: string;
+  appointmentDate?: string;
+  appointmentSlot?: string;
   calledAt?: string;
   servingStartedAt?: string;
   completedAt?: string;

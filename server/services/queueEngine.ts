@@ -263,12 +263,144 @@ export function broadcastFacilitySnapshot(facilityId: string, event: string, ext
   wsHub.broadcast('all', event, { facilityId, ...extra, snapshot });
 }
 
+const PREBOOK_SLOT_TEMPLATES = [
+  { slot: '08:00 AM', hourLabel: '8 AM' },
+  { slot: '08:30 AM', hourLabel: '8 AM' },
+  { slot: '09:00 AM', hourLabel: '9 AM' },
+  { slot: '09:30 AM', hourLabel: '9 AM' },
+  { slot: '10:00 AM', hourLabel: '10 AM' },
+  { slot: '10:30 AM', hourLabel: '10 AM' },
+  { slot: '11:00 AM', hourLabel: '11 AM' },
+  { slot: '11:30 AM', hourLabel: '11 AM' },
+  { slot: '12:00 PM', hourLabel: '12 PM' },
+  { slot: '01:00 PM', hourLabel: '1 PM' },
+  { slot: '01:30 PM', hourLabel: '1 PM' },
+  { slot: '02:00 PM', hourLabel: '2 PM' },
+  { slot: '02:30 PM', hourLabel: '2 PM' },
+  { slot: '03:00 PM', hourLabel: '3 PM' },
+  { slot: '03:30 PM', hourLabel: '3 PM' },
+  { slot: '04:00 PM', hourLabel: '4 PM' },
+  { slot: '04:30 PM', hourLabel: '4 PM' },
+];
+
+export interface AppointmentSlotItem {
+  slot: string;
+  hourLabel: string;
+  bookedCount: number;
+  maxCapacity: number;
+  remainingSpots: number;
+  isAvailable: boolean;
+  crowdLevel: CrowdLevel;
+  isBestTime: boolean;
+  isPeak: boolean;
+  estimatedWaitMins: number;
+}
+
+export interface AppointmentSlotsResult {
+  facilityId: string;
+  queueId: string;
+  queueName: string;
+  date: string;
+  slots: AppointmentSlotItem[];
+}
+
+export function normalizeAppointmentDate(date?: string): string {
+  if (date && /^\d{4}-\d{2}-\d{2}$/.test(date.trim())) {
+    return date.trim();
+  }
+  return new Date().toISOString().slice(0, 10);
+}
+
+export function getAppointmentSlots(params: {
+  facilityId: string;
+  queueId: string;
+  date?: string;
+}): AppointmentSlotsResult | null {
+  const db = dbStore.getState();
+  const facility = db.facilities.find((f) => f.id === params.facilityId);
+  const queue = db.queues.find(
+    (q) => q.id === params.queueId && q.facilityId === params.facilityId
+  );
+  if (!facility || !queue) return null;
+
+  const targetDate = normalizeAppointmentDate(params.date);
+  const activeCountersForQueue = Math.max(
+    1,
+    db.counters.filter(
+      (c) => c.facilityId === params.facilityId && c.queueId === queue.id && c.status !== 'Closed'
+    ).length
+  );
+  const maxCapacity = Math.min(
+    12,
+    Math.max(4, Math.floor(30 / Math.max(2, queue.avgServiceMinutes)) * activeCountersForQueue)
+  );
+
+  const orgDash = getOrganisationAnalyticsDashboard({
+    facilityId: params.facilityId,
+    period: 'daily',
+  });
+  const hourlyMap = new Map(
+    (orgDash?.hourlyFootfall || []).map((h) => [h.hour, h])
+  );
+
+  const slots: AppointmentSlotItem[] = PREBOOK_SLOT_TEMPLATES.map((tpl) => {
+    const bookedCount = db.tokens.filter(
+      (t) =>
+        t.facilityId === params.facilityId &&
+        t.queueId === queue.id &&
+        t.appointmentSlot === tpl.slot &&
+        (t.appointmentDate || targetDate) === targetDate &&
+        !['Cancelled', 'Skipped', 'NoShow', 'Completed'].includes(t.status)
+    ).length;
+
+    const remainingSpots = Math.max(0, maxCapacity - bookedCount);
+    const hrMeta = hourlyMap.get(tpl.hourLabel);
+    const isPeak = hrMeta ? hrMeta.isPeak : tpl.hourLabel === '10 AM' || tpl.hourLabel === '11 AM';
+    const isBestTime = hrMeta ? hrMeta.isRecommended : !isPeak && (tpl.hourLabel === '8 AM' || tpl.hourLabel === '1 PM' || tpl.hourLabel === '2 PM' || tpl.hourLabel === '3 PM');
+    const crowdLevel: CrowdLevel = hrMeta
+      ? hrMeta.crowdLevel
+      : isPeak
+        ? 'High'
+        : isBestTime
+          ? 'Low'
+          : 'Medium';
+    const baseHourWait = hrMeta ? hrMeta.avgWaitMins : isPeak ? 22 : isBestTime ? 8 : 13;
+    const estimatedWaitMins = Math.max(
+      2,
+      Math.round(baseHourWait * 0.65 + bookedCount * Math.max(1.5, queue.avgServiceMinutes * 0.5))
+    );
+
+    return {
+      slot: tpl.slot,
+      hourLabel: tpl.hourLabel,
+      bookedCount,
+      maxCapacity,
+      remainingSpots,
+      isAvailable: remainingSpots > 0,
+      crowdLevel,
+      isBestTime,
+      isPeak,
+      estimatedWaitMins,
+    };
+  });
+
+  return {
+    facilityId: facility.id,
+    queueId: queue.id,
+    queueName: queue.name,
+    date: targetDate,
+    slots,
+  };
+}
+
 export function issueToken(params: {
   facilityId: string;
   queueId: string;
   channel: EntryChannel;
   citizenName?: string;
   userId?: string;
+  appointmentDate?: string;
+  appointmentSlot?: string;
 }): { token: HydratedToken; snapshot: FacilitySnapshot } {
   const db = dbStore.getState();
   const facility = db.facilities.find((f) => f.id === params.facilityId);
@@ -301,6 +433,27 @@ export function issueToken(params: {
     }
   }
 
+  let normalizedDate: string | undefined;
+  let normalizedSlot: string | undefined;
+  if (params.appointmentSlot && params.appointmentSlot.trim()) {
+    normalizedSlot = params.appointmentSlot.trim();
+    normalizedDate = normalizeAppointmentDate(params.appointmentDate);
+    const slotInfo = getAppointmentSlots({
+      facilityId: params.facilityId,
+      queueId: queue.id,
+      date: normalizedDate,
+    });
+    const matched = slotInfo?.slots.find((s) => s.slot === normalizedSlot);
+    if (!matched) {
+      throw new Error(`Selected appointment time '${normalizedSlot}' is not valid for this service center.`);
+    }
+    if (!matched.isAvailable) {
+      throw new Error(`Time slot ${normalizedSlot} on ${normalizedDate} is already full. Please select another slot.`);
+    }
+  } else if (queue.priority === 'appointment' && params.appointmentDate) {
+    normalizedDate = normalizeAppointmentDate(params.appointmentDate);
+  }
+
   const numberValue = queue.nextIssueNumber;
   queue.nextIssueNumber += 1;
 
@@ -327,6 +480,8 @@ export function issueToken(params: {
     priority: queue.priority,
     status: 'Waiting',
     joinedAt,
+    appointmentDate: normalizedDate,
+    appointmentSlot: normalizedSlot,
     createdAtMs: Date.now(),
   };
 
@@ -336,8 +491,12 @@ export function issueToken(params: {
     facilityId: params.facilityId,
     userId: params.userId,
     tokenId: token.tokenId,
-    title: `Token ${token.tokenId} Confirmed`,
-    message: `Reserved in ${queue.name} (${queue.location}) at ${facility.name} via ${params.channel}.`,
+    title: normalizedSlot
+      ? `Pre-Booked ${token.tokenId} · ${normalizedSlot}`
+      : `Token ${token.tokenId} Confirmed`,
+    message: normalizedSlot
+      ? `Reserved in ${queue.name} for ${normalizedDate} at ${normalizedSlot} (${queue.location}) at ${facility.name} via ${params.channel}.`
+      : `Reserved in ${queue.name} (${queue.location}) at ${facility.name} via ${params.channel}.`,
     category: 'token',
   });
   dbStore.save();
