@@ -15,11 +15,21 @@ import type {
   NotificationCategory,
   NotificationItem,
   OrganisationAnalyticsDashboardResponse,
+  QueueLifecycleState,
   SystemSettings,
   TokenStatus,
   UserRole,
 } from './api';
 import type { QueueWsMessage } from '../hooks/useQueueSocket';
+import {
+  diffCalendarDaysIso,
+  formatAppointmentCountdown,
+  formatIstDateShort,
+  getIstDateIso,
+  getIstHourMinute,
+  getIstTimeFormatted,
+  parseSlotToMinutesOfDay,
+} from '../utils/istTime';
 
 const STATIC_DB_KEY = 'smartqueue_static_db_v1';
 const STATIC_MODE_KEY = 'smartqueue_static_mode';
@@ -39,6 +49,9 @@ interface StoredToken extends ApiTokenRecord {
   assignedOperatorId?: string;
   recallCount?: number;
   createdAtMs: number;
+  checkedInAtMs?: number;
+  servingStartedAtMs?: number;
+  completedAtMs?: number;
 }
 
 interface StoredQueue {
@@ -197,10 +210,7 @@ function uid(prefix: string): string {
 }
 
 function formatNowTime(): string {
-  return new Date().toLocaleTimeString([], {
-    hour: 'numeric',
-    minute: '2-digit',
-  });
+  return getIstTimeFormatted(new Date());
 }
 
 function normalizeRole(role?: string | null): UserRole {
@@ -243,6 +253,7 @@ function parseStaticToken(token: string | null): { sub: string; exp: number } | 
 function createSeedDatabase(): StaticDatabase {
   const nowIso = new Date().toISOString();
   const baseMs = Date.now();
+  const todayIst = getIstDateIso();
   const defaultTraffic: HourlyTrafficPoint[] = [
     { hour: '8 AM', footfall: 28, avgWaitMins: 8 },
     { hour: '9 AM', footfall: 52, avgWaitMins: 14 },
@@ -561,6 +572,17 @@ function createSeedDatabase(): StaticDatabase {
         avgCycleMins: 2,
       },
       {
+        id: 'c5',
+        facilityId: 'vja-hospital',
+        departmentId: 'dept-appointments',
+        label: 'Desk 5',
+        staffName: 'Dr. Madhavi Latha',
+        queueId: 'online-appointment',
+        status: 'Serving',
+        currentToken: 'Q-20',
+        avgCycleMins: 3,
+      },
+      {
         id: 'c-eseva-1',
         facilityId: 'eseva-center',
         departmentId: 'dept-eseva-civic',
@@ -607,10 +629,18 @@ function createSeedDatabase(): StaticDatabase {
         channel: 'SMS',
         priority: 'standard',
         status: 'Completed',
+        appointmentDate: todayIst,
+        isPreBooked: false,
+        checkedIn: true,
+        checkedInAt: '10:12 AM',
+        checkedInAtMs: baseMs - 45 * 60000,
         joinedAt: '10:12 AM',
         calledAt: '10:25 AM',
         servingStartedAt: '10:26 AM',
+        servingStartedAtMs: baseMs - 34 * 60000,
         completedAt: '10:30 AM',
+        completedAtMs: baseMs - 30 * 60000,
+        actualServiceMinutes: 4,
         aheadCount: 0,
         etaMinutes: 0,
         createdAtMs: baseMs - 45 * 60000,
@@ -627,9 +657,15 @@ function createSeedDatabase(): StaticDatabase {
         channel: 'App QR',
         priority: 'standard',
         status: 'Serving',
+        appointmentDate: todayIst,
+        isPreBooked: false,
+        checkedIn: true,
+        checkedInAt: '10:34 AM',
+        checkedInAtMs: baseMs - 24 * 60000,
         joinedAt: '10:34 AM',
         calledAt: '10:48 AM',
         servingStartedAt: '10:49 AM',
+        servingStartedAtMs: baseMs - 9 * 60000,
         aheadCount: 0,
         etaMinutes: 0,
         createdAtMs: baseMs - 24 * 60000,
@@ -646,6 +682,11 @@ function createSeedDatabase(): StaticDatabase {
         channel: 'Missed Call',
         priority: 'standard',
         status: 'Waiting',
+        appointmentDate: todayIst,
+        isPreBooked: false,
+        checkedIn: true,
+        checkedInAt: '10:36 AM',
+        checkedInAtMs: baseMs - 22 * 60000,
         joinedAt: '10:36 AM',
         aheadCount: 1,
         etaMinutes: 4,
@@ -663,6 +704,11 @@ function createSeedDatabase(): StaticDatabase {
         channel: 'SMS',
         priority: 'standard',
         status: 'Waiting',
+        appointmentDate: todayIst,
+        isPreBooked: false,
+        checkedIn: true,
+        checkedInAt: '10:39 AM',
+        checkedInAtMs: baseMs - 19 * 60000,
         joinedAt: '10:39 AM',
         aheadCount: 2,
         etaMinutes: 7,
@@ -680,6 +726,11 @@ function createSeedDatabase(): StaticDatabase {
         channel: 'App QR',
         priority: 'standard',
         status: 'Waiting',
+        appointmentDate: todayIst,
+        isPreBooked: false,
+        checkedIn: true,
+        checkedInAt: '10:42 AM',
+        checkedInAtMs: baseMs - 16 * 60000,
         joinedAt: '10:42 AM',
         aheadCount: 3,
         etaMinutes: 11,
@@ -697,6 +748,11 @@ function createSeedDatabase(): StaticDatabase {
         channel: 'SMS',
         priority: 'standard',
         status: 'Waiting',
+        appointmentDate: todayIst,
+        isPreBooked: false,
+        checkedIn: true,
+        checkedInAt: '10:45 AM',
+        checkedInAtMs: baseMs - 13 * 60000,
         joinedAt: '10:45 AM',
         aheadCount: 4,
         etaMinutes: 14,
@@ -714,10 +770,42 @@ function createSeedDatabase(): StaticDatabase {
         channel: 'App QR',
         priority: 'standard',
         status: 'Waiting',
+        appointmentDate: todayIst,
+        isPreBooked: false,
+        checkedIn: true,
+        checkedInAt: '10:48 AM',
+        checkedInAtMs: baseMs - 10 * 60000,
         joinedAt: '10:48 AM',
         aheadCount: 5,
         etaMinutes: 18,
         createdAtMs: baseMs - 10 * 60000,
+      },
+      {
+        tokenId: 'Q-20',
+        facilityId: 'vja-hospital',
+        departmentId: 'dept-appointments',
+        queueId: 'online-appointment',
+        queueName: 'Online Pre-Booked',
+        counterId: 'c5',
+        numberValue: 20,
+        citizenName: 'Sujatha Reddy',
+        channel: 'App QR',
+        priority: 'appointment',
+        status: 'Serving',
+        appointmentDate: todayIst,
+        appointmentSlot: '10:30 AM',
+        isPreBooked: true,
+        checkedIn: true,
+        checkedInAt: '10:22 AM',
+        checkedInAtMs: baseMs - 18 * 60000,
+        joinedAt: '10:15 AM',
+        calledAt: '10:32 AM',
+        servingStartedAt: '10:33 AM',
+        servingStartedAtMs: baseMs - 5 * 60000,
+        qrCodePayload: `SQ:vja-hospital:online-appointment:Q-20:${todayIst}`,
+        aheadCount: 0,
+        etaMinutes: 0,
+        createdAtMs: baseMs - 25 * 60000,
       },
     ],
     swaps: [
@@ -782,6 +870,9 @@ function createSeedDatabase(): StaticDatabase {
       enableEmailNotifications: true,
       workingHoursStart: '08:00',
       workingHoursEnd: '18:00',
+      timezone: 'Asia/Kolkata',
+      checkInWindowBeforeMins: 120,
+      autoAdvanceOnComplete: true,
       updatedAt: nowIso,
     },
     metrics: {
@@ -792,19 +883,56 @@ function createSeedDatabase(): StaticDatabase {
   };
 }
 
+function normalizeStaticDb(db: StaticDatabase): StaticDatabase {
+  const todayIst = getIstDateIso();
+  if (!db.counters.some((c) => c.id === 'c5')) {
+    db.counters.push({
+      id: 'c5',
+      facilityId: 'vja-hospital',
+      departmentId: 'dept-appointments',
+      label: 'Desk 5',
+      staffName: 'Dr. Madhavi Latha',
+      queueId: 'online-appointment',
+      status: 'Serving',
+      currentToken: 'Q-20',
+      avgCycleMins: 3,
+    });
+  }
+  db.settings = {
+    ...db.settings,
+    timezone: db.settings.timezone || 'Asia/Kolkata',
+    checkInWindowBeforeMins: db.settings.checkInWindowBeforeMins ?? 120,
+    autoAdvanceOnComplete: db.settings.autoAdvanceOnComplete ?? true,
+  };
+  for (const tok of db.tokens) {
+    if (!tok.appointmentDate) tok.appointmentDate = todayIst;
+    if (typeof tok.isPreBooked !== 'boolean') {
+      tok.isPreBooked = Boolean(tok.appointmentSlot) || tok.queueId === 'online-appointment';
+    }
+    if (typeof tok.checkedIn !== 'boolean') {
+      const diff = diffCalendarDaysIso(tok.appointmentDate, todayIst);
+      tok.checkedIn = diff === 0 && (tok.status === 'Serving' || tok.status === 'Called' || tok.status === 'Completed' || !tok.isPreBooked);
+    }
+    if (!tok.qrCodePayload) {
+      tok.qrCodePayload = `SQ:${tok.facilityId}:${tok.queueId}:${tok.tokenId}:${tok.appointmentDate}`;
+    }
+  }
+  return db;
+}
+
 function loadDb(): StaticDatabase {
   try {
     const raw = localStorage.getItem(STATIC_DB_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<StaticDatabase>;
       if (parsed && Array.isArray(parsed.facilities) && Array.isArray(parsed.queues)) {
-        return parsed as StaticDatabase;
+        return normalizeStaticDb(parsed as StaticDatabase);
       }
     }
   } catch {
     // Ignore storage read error
   }
-  const seed = createSeedDatabase();
+  const seed = normalizeStaticDb(createSeedDatabase());
   saveDb(seed);
   return seed;
 }
@@ -817,20 +945,218 @@ function saveDb(db: StaticDatabase): void {
   }
 }
 
-function computeQueueWaitMins(q: StoredQueue, ahead: number, activeCounters: number): number {
+const PRIORITY_RANK: Record<QueuePriority, number> = {
+  emergency: 0,
+  senior: 1,
+  appointment: 2,
+  standard: 3,
+};
+
+const ACTIVE_STATUSES = new Set(['Waiting', 'Called', 'Serving', 'Grace']);
+
+function computeQueueWaitMins(q: StoredQueue, ahead: number, activeCounters: number): number | null {
+  if (q.isPaused || activeCounters <= 0) return null;
   if (ahead <= 0) return 0;
-  return Math.max(2, Math.round((ahead * q.avgServiceMinutes) / Math.max(1, activeCounters)));
+  return Math.max(1, Math.round((ahead * q.avgServiceMinutes) / activeCounters));
 }
 
-function getSnapshot(db: StaticDatabase, facilityId: string): FacilitySnapshotResponse | null {
+function computeQueueOverviewWaitMins(q: StoredQueue, waiting: number, activeCounters: number): number {
+  if (waiting <= 0) return 0;
+  return Math.max(1, Math.round((waiting * q.avgServiceMinutes) / Math.max(1, activeCounters)));
+}
+
+function compareActiveTokens(a: StoredToken, b: StoredToken): number {
+  const rank = (t: StoredToken) => (t.status === 'Serving' ? 0 : t.status === 'Called' ? 1 : 2);
+  const diff = rank(a) - rank(b);
+  if (diff !== 0) return diff;
+  const pDiff = (PRIORITY_RANK[a.priority] ?? 3) - (PRIORITY_RANK[b.priority] ?? 3);
+  if (pDiff !== 0) return pDiff;
+  const timeDiff = (a.checkedInAtMs ?? a.createdAtMs) - (b.checkedInAtMs ?? b.createdAtMs);
+  if (timeDiff !== 0) return timeDiff;
+  return a.numberValue - b.numberValue;
+}
+
+function hydrateTokenWithContext(
+  db: StaticDatabase,
+  t: StoredToken,
+  todayIst: string,
+  now: Date
+): ApiTokenRecord {
+  const facility = db.facilities.find((f) => f.id === t.facilityId);
+  const queue = db.queues.find((q) => q.id === t.queueId && q.facilityId === t.facilityId);
+  const dept = db.departments.find((d) => d.id === (t.departmentId || queue?.departmentId));
+  const queueCounters = db.counters.filter((c) => c.facilityId === t.facilityId && c.queueId === t.queueId);
+  const cnt =
+    queueCounters.find((c) => c.id === t.counterId) ||
+    queueCounters.find((c) => c.status !== 'Closed') ||
+    queueCounters[0];
+
+  const apptDate = t.appointmentDate || todayIst;
+  const diffDays = diffCalendarDaysIso(apptDate, todayIst);
+  const checkedIn = typeof t.checkedIn === 'boolean' ? t.checkedIn : true;
+  const countdownText = formatAppointmentCountdown(apptDate, todayIst);
+
+  if (t.status === 'Completed') {
+    return {
+      ...t,
+      facilityName: facility?.name,
+      departmentName: dept?.name || 'General Services',
+      counterLabel: cnt?.label,
+      queueLifecycleState: 'Completed',
+      bookingStatusLabel: 'Completed',
+      queueStatusLabel: 'Completed',
+      checkInEligible: false,
+      checkInStatusText: t.completedAt ? `Completed at ${t.completedAt}` : 'Service Completed',
+      countdownText: 'Completed',
+      currentServingToken: null,
+      aheadCount: 0,
+      etaMinutes: 0,
+      waitStatusMessage: t.actualServiceMinutes ? `Completed in ${t.actualServiceMinutes}m` : 'Service completed',
+    };
+  }
+
+  if (['Cancelled', 'Skipped', 'NoShow'].includes(t.status)) {
+    return {
+      ...t,
+      facilityName: facility?.name,
+      departmentName: dept?.name || 'General Services',
+      counterLabel: cnt?.label,
+      queueLifecycleState: 'Cancelled',
+      bookingStatusLabel: t.status,
+      queueStatusLabel: t.status,
+      checkInEligible: false,
+      checkInStatusText: 'Appointment closed',
+      countdownText: 'Closed',
+      currentServingToken: null,
+      aheadCount: null,
+      etaMinutes: null,
+      waitStatusMessage: `Booking ${t.status.toLowerCase()}`,
+    };
+  }
+
+  if (diffDays > 0) {
+    return {
+      ...t,
+      facilityName: facility?.name,
+      departmentName: dept?.name || 'General Services',
+      counterLabel: cnt?.label,
+      queueLifecycleState: 'Upcoming Appointment',
+      bookingStatusLabel: 'Upcoming',
+      queueStatusLabel: 'Not Started',
+      checkInEligible: false,
+      checkInStatusText: 'Available on appointment day',
+      countdownText,
+      currentServingToken: null,
+      aheadCount: null,
+      etaMinutes: null,
+      waitStatusMessage: 'Available after check-in',
+    };
+  }
+
+  if (!checkedIn) {
+    const windowMins = db.settings.checkInWindowBeforeMins ?? 120;
+    const slotMins = t.appointmentSlot ? parseSlotToMinutesOfDay(t.appointmentSlot) : null;
+    const hm = getIstHourMinute(now);
+    const nowMins = hm.hour * 60 + hm.minute;
+    const eligible =
+      diffDays === 0 && (slotMins === null || nowMins >= slotMins - windowMins);
+
+    return {
+      ...t,
+      facilityName: facility?.name,
+      departmentName: dept?.name || 'General Services',
+      counterLabel: cnt?.label,
+      queueLifecycleState: 'Check-In Required',
+      bookingStatusLabel: diffDays < 0 ? 'Expired' : 'Today',
+      queueStatusLabel: diffDays < 0 ? 'Expired' : 'Check-In Pending',
+      checkInEligible: eligible,
+      checkInStatusText:
+        diffDays < 0
+          ? 'Appointment date passed'
+          : eligible
+            ? 'Ready for QR check-in now'
+            : `Opens ${Math.floor(windowMins / 60)}h before slot`,
+      countdownText,
+      currentServingToken: null,
+      aheadCount: null,
+      etaMinutes: null,
+      waitStatusMessage: 'Waiting time will be available after check-in.',
+    };
+  }
+
+  const orderedActive = db.tokens
+    .filter(
+      (tok) =>
+        tok.facilityId === t.facilityId &&
+        tok.queueId === t.queueId &&
+        (tok.appointmentDate || todayIst) === todayIst &&
+        (typeof tok.checkedIn === 'boolean' ? tok.checkedIn : true) &&
+        ACTIVE_STATUSES.has(tok.status)
+    )
+    .slice()
+    .sort(compareActiveTokens);
+
+  const serving = orderedActive.find((x) => x.status === 'Serving') || orderedActive.find((x) => x.status === 'Called');
+  const activeCounterWithToken = queueCounters.find(
+    (c) => (c.status === 'Serving' || c.status === 'Busy') && c.currentToken && c.currentToken !== '—'
+  );
+  const currentServingToken =
+    serving?.tokenId || activeCounterWithToken?.currentToken || (queue ? `${queue.prefix}-${queue.servingNumber}` : null);
+
+  const activeCounters = queueCounters.filter((c) => c.status === 'Serving' || c.status === 'Busy').length;
+  const idx = orderedActive.findIndex((x) => x.tokenId === t.tokenId);
+  const aheadCount =
+    t.status === 'Serving' || t.status === 'Called'
+      ? 0
+      : idx >= 0
+        ? orderedActive.slice(0, idx).filter((x) => x.status !== 'Serving' && x.status !== 'Called').length +
+          (serving ? 1 : 0)
+        : 0;
+  const etaMinutes =
+    t.status === 'Serving' || t.status === 'Called'
+      ? 0
+      : queue
+        ? computeQueueWaitMins(queue, aheadCount, activeCounters)
+        : null;
+
+  let waitStatusMessage = `${etaMinutes ?? 0} min`;
+  if (queue?.isPaused) waitStatusMessage = 'Queue paused — wait recalculating when resumed';
+  else if (activeCounters <= 0) waitStatusMessage = 'No active counters open yet';
+  else if (t.status === 'Serving' || t.status === 'Called') waitStatusMessage = 'Your turn now';
+  else if (aheadCount === 0) waitStatusMessage = 'Next in queue';
+
+  return {
+    ...t,
+    facilityName: facility?.name,
+    departmentName: dept?.name || 'General Services',
+    counterLabel: cnt?.label,
+    queueLifecycleState: 'Active Queue' as QueueLifecycleState,
+    bookingStatusLabel: 'Active',
+    queueStatusLabel: t.status,
+    checkInEligible: false,
+    checkInStatusText: t.checkedInAt ? `Checked in at ${t.checkedInAt}` : 'Checked in',
+    countdownText: 'Today',
+    currentServingToken,
+    aheadCount,
+    etaMinutes,
+    waitStatusMessage,
+  };
+}
+
+function getSnapshot(db: StaticDatabase, facilityId: string, now = new Date()): FacilitySnapshotResponse | null {
   const facility = db.facilities.find((f) => f.id === facilityId);
   if (!facility) return null;
 
+  const todayIst = getIstDateIso(now);
   const depts = db.departments.filter((d) => d.facilityId === facilityId);
   const queues = db.queues.filter((q) => q.facilityId === facilityId);
   const counters = db.counters.filter((c) => c.facilityId === facilityId);
   const activeTokens = db.tokens.filter(
-    (t) => t.facilityId === facilityId && ['Waiting', 'Called', 'Serving', 'Grace'].includes(t.status)
+    (t) =>
+      t.facilityId === facilityId &&
+      (t.appointmentDate || todayIst) === todayIst &&
+      (typeof t.checkedIn === 'boolean' ? t.checkedIn : true) &&
+      ACTIVE_STATUSES.has(t.status)
   );
 
   const hydratedQueues: ApiQueue[] = queues.map((q) => {
@@ -841,13 +1167,13 @@ function getSnapshot(db: StaticDatabase, facilityId: string): FacilitySnapshotRe
     const waitingTokens = activeTokens.filter(
       (t) => t.queueId === q.id && ['Waiting', 'Called', 'Grace'].includes(t.status)
     );
-    const waitingCount = Math.max(waitingTokens.length, Math.max(0, q.nextIssueNumber - q.servingNumber - 1));
+    const waitingCount = waitingTokens.length;
     return {
       ...q,
       departmentName: dept?.name || 'General Services',
       waitingCount,
       activeCounters,
-      predictedWaitMins: computeQueueWaitMins(q, waitingCount, activeCounters),
+      predictedWaitMins: computeQueueOverviewWaitMins(q, waitingCount, activeCounters),
     };
   });
 
@@ -863,24 +1189,8 @@ function getSnapshot(db: StaticDatabase, facilityId: string): FacilitySnapshotRe
 
   const roster: ApiTokenRecord[] = activeTokens
     .slice()
-    .sort((a, b) => a.numberValue - b.numberValue)
-    .map((t) => {
-      const q = hydratedQueues.find((hq) => hq.id === t.queueId);
-      const dept = depts.find((d) => d.id === (t.departmentId || q?.departmentId));
-      const cnt = counters.find((c) => c.id === t.counterId || (c.queueId === t.queueId && c.status !== 'Closed'));
-      const aheadCount = q ? Math.max(0, t.numberValue - q.servingNumber) : 0;
-      const etaMinutes =
-        t.status === 'Serving' || t.status === 'Called' || !q
-          ? 0
-          : computeQueueWaitMins(q, aheadCount, q.activeCounters);
-      return {
-        ...t,
-        departmentName: dept?.name || 'General Services',
-        counterLabel: cnt?.label,
-        aheadCount,
-        etaMinutes,
-      };
-    });
+    .sort(compareActiveTokens)
+    .map((t) => hydrateTokenWithContext(db, t, todayIst, now));
 
   const openSwaps = db.swaps.filter((s) => s.facilityId === facilityId && s.status === 'open');
   const standbyCounter = counters.find((c) => c.status === 'Closed');
@@ -906,6 +1216,7 @@ function getSnapshot(db: StaticDatabase, facilityId: string): FacilitySnapshotRe
 
   return {
     facilityId,
+    todayIst,
     departments: depts as ApiDepartment[],
     queues: hydratedQueues,
     counters: hydratedCounters,
@@ -1273,6 +1584,36 @@ export async function handleStaticApiRequest<T>(
 
   // Citizen
   if (path === '/api/citizen/overview' && method === 'GET') {
+    const todayIst = getIstDateIso();
+    let notifMutated = false;
+    for (const tok of db.tokens) {
+      if (tok.userId !== user.id || !['Waiting', 'Grace'].includes(tok.status)) continue;
+      const apptDate = tok.appointmentDate || todayIst;
+      const diff = diffCalendarDaysIso(apptDate, todayIst);
+      if (diff === 1 && !db.notifications.some((n) => n.tokenId === tok.tokenId && n.title.startsWith('Appointment Reminder'))) {
+        pushNotif(db, {
+          facilityId: tok.facilityId,
+          userId: user.id,
+          tokenId: tok.tokenId,
+          title: `Appointment Reminder · ${tok.tokenId}`,
+          message: `Your appointment in ${tok.queueName} is tomorrow (${formatIstDateShort(apptDate)}${tok.appointmentSlot ? ` at ${tok.appointmentSlot}` : ''} IST).`,
+          category: 'token',
+        });
+        notifMutated = true;
+      } else if (diff === 0 && tok.checkedIn === false && !db.notifications.some((n) => n.tokenId === tok.tokenId && n.title.startsWith('Check-In Available'))) {
+        pushNotif(db, {
+          facilityId: tok.facilityId,
+          userId: user.id,
+          tokenId: tok.tokenId,
+          title: `Check-In Available · ${tok.tokenId}`,
+          message: `Your appointment today (${tok.appointmentSlot || 'Scheduled'}) is ready for QR check-in at ${tok.queueName}.`,
+          category: 'token',
+        });
+        notifMutated = true;
+      }
+    }
+    if (notifMutated) saveDb(db);
+
     const centers = db.facilities
       .filter((f) => f.isActive)
       .map((f) => {
@@ -1287,9 +1628,7 @@ export async function handleStaticApiRequest<T>(
     const active = db.tokens.find(
       (t) => t.userId === user.id && ['Waiting', 'Called', 'Serving', 'Grace'].includes(t.status)
     );
-    const activeToken = active
-      ? getSnapshot(db, active.facilityId)?.roster.find((r) => r.tokenId === active.tokenId) || active
-      : null;
+    const activeToken = active ? hydrateTokenWithContext(db, active, todayIst, new Date()) : null;
     return { centers, activeToken } as T;
   }
 
@@ -1315,11 +1654,17 @@ export async function handleStaticApiRequest<T>(
           channel: t.channel,
           priority: t.priority,
           status: t.status,
+          isPreBooked: t.isPreBooked,
+          checkedIn: t.checkedIn,
+          checkedInAt: t.checkedInAt,
+          qrCodePayload: t.qrCodePayload,
+          actualServiceMinutes: t.actualServiceMinutes,
           joinedAt: t.joinedAt,
           appointmentDate: t.appointmentDate,
           appointmentSlot: t.appointmentSlot,
           calledAt: t.calledAt,
           completedAt: t.completedAt,
+          completedAtMs: t.completedAtMs,
           cancelledAt: t.cancelledAt,
           createdAtMs: t.createdAtMs,
         };
@@ -1340,9 +1685,8 @@ export async function handleStaticApiRequest<T>(
     const facilityId = decodeURIComponent(queueSlotsMatch[1]);
     const queueId = parsedUrl.searchParams.get('queueId') || '';
     const dateParam = parsedUrl.searchParams.get('date') || '';
-    const targetDate = /^\d{4}-\d{2}-\d{2}$/.test(dateParam)
-      ? dateParam
-      : new Date().toISOString().slice(0, 10);
+    const todayIst = getIstDateIso();
+    const targetDate = /^\d{4}-\d{2}-\d{2}$/.test(dateParam) ? dateParam : todayIst;
     const facility = db.facilities.find((f) => f.id === facilityId);
     const queue = db.queues.find((q) => q.id === queueId && q.facilityId === facilityId);
     if (!facility || !queue) throw new StaticApiHttpError('Queue not found.', 404);
@@ -1375,16 +1719,17 @@ export async function handleStaticApiRequest<T>(
       { slot: '04:30 PM', hourLabel: '4 PM' },
     ];
     const hourTrafficMap = new Map((db.hourlyTraffic[facilityId] || []).map((h) => [h.hour, h]));
+    const isPastDate = diffCalendarDaysIso(targetDate, todayIst) < 0;
     const slots = templates.map((tpl) => {
       const bookedCount = db.tokens.filter(
         (t) =>
           t.facilityId === facilityId &&
           t.queueId === queue.id &&
           t.appointmentSlot === tpl.slot &&
-          (t.appointmentDate || targetDate) === targetDate &&
+          (t.appointmentDate || todayIst) === targetDate &&
           !['Cancelled', 'Skipped', 'NoShow', 'Completed'].includes(t.status)
       ).length;
-      const remainingSpots = Math.max(0, maxCapacity - bookedCount);
+      const remainingSpots = isPastDate ? 0 : Math.max(0, maxCapacity - bookedCount);
       const hrMeta = hourTrafficMap.get(tpl.hourLabel);
       const isPeak = Boolean(hrMeta?.isPeak ?? (tpl.hourLabel === '10 AM' || tpl.hourLabel === '11 AM'));
       const isBestTime = Boolean(hrMeta?.isRecommended ?? (!isPeak && (tpl.hourLabel === '8 AM' || tpl.hourLabel === '1 PM' || tpl.hourLabel === '2 PM' || tpl.hourLabel === '3 PM')));
@@ -1396,7 +1741,7 @@ export async function handleStaticApiRequest<T>(
         bookedCount,
         maxCapacity,
         remainingSpots,
-        isAvailable: remainingSpots > 0,
+        isAvailable: !isPastDate && remainingSpots > 0,
         crowdLevel,
         isBestTime,
         isPeak,
@@ -1408,6 +1753,8 @@ export async function handleStaticApiRequest<T>(
 
   const issueTokenMatch = path.match(/^\/api\/queues\/([^/]+)\/tokens$/);
   if (issueTokenMatch && method === 'POST') {
+    const now = new Date();
+    const todayIst = getIstDateIso(now);
     const facilityId = decodeURIComponent(issueTokenMatch[1]);
     const queueId = String(body.queueId || '');
     const channel = (body.channel as EntryChannel) || 'App QR';
@@ -1415,14 +1762,19 @@ export async function handleStaticApiRequest<T>(
       ? body.appointmentSlot.trim()
       : undefined;
     const rawDate = typeof body.appointmentDate === 'string' ? body.appointmentDate.trim() : '';
-    const appointmentDate = appointmentSlot || (rawDate && /^\d{4}-\d{2}-\d{2}$/.test(rawDate))
-      ? (/^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? rawDate : new Date().toISOString().slice(0, 10))
-      : undefined;
+    const appointmentDate = /^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? rawDate : todayIst;
+    if (diffCalendarDaysIso(appointmentDate, todayIst) < 0) {
+      throw new StaticApiHttpError('Cannot book an appointment in the past (IST date).', 400);
+    }
+
+    const isPreBooked = Boolean(body.isPreBooked) || Boolean(appointmentSlot) || appointmentDate > todayIst;
+    const isToday = appointmentDate === todayIst;
+    const checkedIn = !isPreBooked && isToday;
 
     const facility = db.facilities.find((f) => f.id === facilityId && f.isActive);
     const queue = db.queues.find((q) => q.id === queueId && q.facilityId === facilityId && q.isActive);
     if (!facility || !queue) throw new StaticApiHttpError('Service queue not found.', 400);
-    if (queue.isPaused) throw new StaticApiHttpError(`Service '${queue.name}' is paused.`, 400);
+    if (isToday && queue.isPaused) throw new StaticApiHttpError(`Service '${queue.name}' is paused.`, 400);
 
     const activeForUser = db.tokens.filter(
       (t) => t.userId === user.id && ['Waiting', 'Called', 'Serving', 'Grace'].includes(t.status)
@@ -1434,12 +1786,30 @@ export async function handleStaticApiRequest<T>(
       );
     }
 
-    const numberValue = queue.nextIssueNumber;
-    queue.nextIssueNumber += 1;
+    let numberValue: number;
+    let tokenId: string;
+    if (isToday) {
+      numberValue = queue.nextIssueNumber;
+      queue.nextIssueNumber += 1;
+      tokenId = `${queue.prefix}-${numberValue}`;
+      while (db.tokens.some((t) => t.facilityId === facilityId && t.queueId === queue.id && (t.appointmentDate || todayIst) === appointmentDate && t.tokenId === tokenId)) {
+        numberValue += 1;
+        tokenId = `${queue.prefix}-${numberValue}`;
+      }
+      queue.nextIssueNumber = Math.max(queue.nextIssueNumber, numberValue + 1);
+    } else {
+      const sameDayDateTokens = db.tokens.filter(
+        (t) => t.facilityId === facilityId && t.queueId === queue.id && t.appointmentDate === appointmentDate
+      );
+      numberValue = sameDayDateTokens.reduce((m, t) => Math.max(m, t.numberValue), 0) + 1;
+      const mmdd = appointmentDate.slice(5).replace('-', '');
+      tokenId = `${queue.prefix}-${mmdd}-${numberValue}`;
+    }
+
     const assignedCounter =
       db.counters.find((c) => c.facilityId === facilityId && c.queueId === queue.id && c.status !== 'Closed') ||
       db.counters.find((c) => c.facilityId === facilityId && c.queueId === queue.id);
-    const tokenId = `${queue.prefix}-${numberValue}`;
+    const nowTime = getIstTimeFormatted(now);
     const token: StoredToken = {
       tokenId,
       facilityId,
@@ -1452,14 +1822,19 @@ export async function handleStaticApiRequest<T>(
       citizenName: String(body.citizenName || user.name).trim() || 'Citizen Guest',
       userId: user.id,
       channel,
-      priority: queue.priority,
+      priority: isPreBooked && queue.priority === 'standard' ? 'appointment' : queue.priority,
       status: 'Waiting',
-      joinedAt: formatNowTime(),
+      joinedAt: nowTime,
       appointmentDate,
       appointmentSlot,
-      aheadCount: 0,
-      etaMinutes: 0,
-      createdAtMs: Date.now(),
+      isPreBooked,
+      checkedIn,
+      checkedInAt: checkedIn ? nowTime : undefined,
+      checkedInAtMs: checkedIn ? now.getTime() : undefined,
+      qrCodePayload: `SQ:${facilityId}:${queue.id}:${tokenId}:${appointmentDate}`,
+      aheadCount: null,
+      etaMinutes: null,
+      createdAtMs: now.getTime(),
     };
     db.tokens.push(token);
     db.metrics.processedDelta += 1;
@@ -1467,16 +1842,73 @@ export async function handleStaticApiRequest<T>(
       facilityId,
       userId: user.id,
       tokenId,
-      title: appointmentSlot ? `Pre-Booked ${tokenId} · ${appointmentSlot}` : `Token ${tokenId} Confirmed`,
-      message: appointmentSlot
-        ? `Reserved in ${queue.name} for ${appointmentDate} at ${appointmentSlot} (${queue.location}) at ${facility.name} via ${channel}.`
-        : `Reserved in ${queue.name} (${queue.location}) at ${facility.name} via ${channel}.`,
+      title: isPreBooked
+        ? `Appointment Confirmed · ${tokenId}`
+        : `Token ${tokenId} Confirmed`,
+      message: isPreBooked
+        ? `Booked in ${queue.name} for ${formatIstDateShort(appointmentDate)}${appointmentSlot ? ` at ${appointmentSlot}` : ''} IST at ${facility.name}. Scan your QR pass on appointment day to join the live queue.`
+        : `Checked in to ${queue.name} (${queue.location}) at ${facility.name} via ${channel}.`,
       category: 'token',
     });
     saveDb(db);
-    const snapshot = getSnapshot(db, facilityId)!;
-    emitStaticEvent(facilityId, 'token:issued', { token, snapshot });
-    return { token: snapshot.roster.find((r) => r.tokenId === tokenId)!, snapshot } as T;
+    const snapshot = getSnapshot(db, facilityId, now)!;
+    const hydrated = hydrateTokenWithContext(db, token, todayIst, now);
+    emitStaticEvent(facilityId, 'token:issued', { token: hydrated, snapshot });
+    return { token: hydrated, snapshot } as T;
+  }
+
+  const qrCheckInMatch = path.match(/^\/api\/queues\/([^/]+)\/check-in-qr$/);
+  if (qrCheckInMatch && method === 'POST') {
+    const facilityId = decodeURIComponent(qrCheckInMatch[1]);
+    const now = new Date();
+    const todayIst = getIstDateIso(now);
+    const qrPayload = String(body.qrPayload || '').trim();
+    const parts = qrPayload.startsWith('SQ:') ? qrPayload.split(':') : [];
+    const targetTokenId = parts.length >= 4 ? parts[3] : String(body.tokenId || '').trim();
+    const token = db.tokens.find((t) => t.facilityId === facilityId && t.tokenId === targetTokenId);
+    if (!token) throw new StaticApiHttpError(`Token '${targetTokenId}' not found.`, 400);
+    if (['Completed', 'Cancelled', 'Skipped', 'NoShow'].includes(token.status)) {
+      throw new StaticApiHttpError(`Token ${token.tokenId} is ${token.status.toLowerCase()} and cannot check in.`, 400);
+    }
+    const apptDate = token.appointmentDate || todayIst;
+    const diff = diffCalendarDaysIso(apptDate, todayIst);
+    if (diff > 0) {
+      throw new StaticApiHttpError(
+        `Check-in blocked: appointment is scheduled for ${formatIstDateShort(apptDate)} IST (${diff} day(s) remaining).`,
+        400
+      );
+    }
+    if (diff < 0) {
+      throw new StaticApiHttpError(`Appointment ${token.tokenId} expired on ${formatIstDateShort(apptDate)} IST.`, 400);
+    }
+    const queue = db.queues.find((q) => q.id === token.queueId && q.facilityId === facilityId);
+    if (queue?.isPaused) {
+      throw new StaticApiHttpError(`Queue '${queue.name}' is currently paused.`, 400);
+    }
+    if (!token.checkedIn) {
+      const windowMins = db.settings.checkInWindowBeforeMins ?? 120;
+      const slotMins = token.appointmentSlot ? parseSlotToMinutesOfDay(token.appointmentSlot) : null;
+      const hm = getIstHourMinute(now);
+      if (slotMins !== null && hm.hour * 60 + hm.minute < slotMins - windowMins) {
+        throw new StaticApiHttpError(`Check-in opens ${Math.floor(windowMins / 60)}h before your ${token.appointmentSlot} IST slot.`, 400);
+      }
+      token.checkedIn = true;
+      token.checkedInAt = getIstTimeFormatted(now);
+      token.checkedInAtMs = now.getTime();
+      pushNotif(db, {
+        facilityId,
+        userId: token.userId,
+        tokenId: token.tokenId,
+        title: `Checked In · ${token.tokenId}`,
+        message: `You are now in the active ${token.queueName} queue. Live wait time is active.`,
+        category: 'turn',
+      });
+      saveDb(db);
+    }
+    const snapshot = getSnapshot(db, facilityId, now)!;
+    const hydrated = snapshot.roster.find((r) => r.tokenId === token.tokenId) || hydrateTokenWithContext(db, token, todayIst, now);
+    emitStaticEvent(facilityId, 'token:checked-in', { tokenId: token.tokenId, token: hydrated, snapshot });
+    return { token: hydrated, snapshot } as T;
   }
 
   const cancelTokenMatch = path.match(/^\/api\/queues\/([^/]+)\/tokens\/([^/]+)\/cancel$/);
@@ -1608,6 +2040,7 @@ export async function handleStaticApiRequest<T>(
       snapshot.departments.find((d) => d.id === (user.assignedDepartmentId || counter?.departmentId)) ||
       snapshot.departments[0] ||
       null;
+    const todayIst = getIstDateIso();
     const liveQueue = snapshot.roster
       .filter((t) => !queue || t.queueId === queue.id)
       .map((t) => {
@@ -1623,22 +2056,48 @@ export async function handleStaticApiRequest<T>(
           channel: t.channel,
           priority: t.priority,
           status: t.status,
+          queueLifecycleState: t.queueLifecycleState,
+          checkedIn: t.checkedIn,
+          isPreBooked: t.isPreBooked,
+          qrCodePayload: t.qrCodePayload,
+          aheadCount: t.aheadCount,
+          waitStatusMessage: t.waitStatusMessage,
           joinedAt: t.joinedAt,
           appointmentDate: storedTok?.appointmentDate,
           appointmentSlot: storedTok?.appointmentSlot,
           calledAt: t.calledAt,
           servingStartedAt: t.servingStartedAt,
           etaMinutes: t.etaMinutes,
-          waitMinsSoFar: Math.max(0, Math.round((Date.now() - createdAtMs) / 60000)),
+          waitMinsSoFar: Math.max(0, Math.round((Date.now() - (storedTok?.checkedInAtMs || createdAtMs)) / 60000)),
           recallCount: storedTok?.recallCount || 0,
           createdAtMs,
         };
       });
+    const pendingCheckIns = db.tokens
+      .filter(
+        (t) =>
+          t.facilityId === facilityId &&
+          (!queue || t.queueId === queue.id) &&
+          (t.appointmentDate || todayIst) === todayIst &&
+          t.checkedIn === false &&
+          ['Waiting', 'Grace'].includes(t.status)
+      )
+      .map((t) => ({
+        tokenId: t.tokenId,
+        citizenLabel: t.citizenName,
+        queueId: t.queueId,
+        queueName: t.queueName,
+        appointmentDate: t.appointmentDate,
+        appointmentSlot: t.appointmentSlot,
+        qrCodePayload: t.qrCodePayload,
+      }));
     const allFacTokens = db.tokens.filter(
       (t) => t.facilityId === facilityId && (!queue || t.queueId === queue.id)
     );
     const history = allFacTokens
       .filter((t) => ['Completed', 'Skipped', 'NoShow', 'Cancelled'].includes(t.status))
+      .slice()
+      .sort((a, b) => (b.completedAtMs || b.createdAtMs) - (a.completedAtMs || a.createdAtMs))
       .slice(0, 50)
       .map((t) => ({
         tokenId: t.tokenId,
@@ -1646,26 +2105,36 @@ export async function handleStaticApiRequest<T>(
         queueName: t.queueName,
         channel: t.channel,
         status: t.status,
+        appointmentDate: t.appointmentDate,
+        appointmentSlot: t.appointmentSlot,
         joinedAt: t.joinedAt,
         calledAt: t.calledAt,
         completedAt: t.completedAt,
-        waitMins: Math.max(1, Math.round((Date.now() - t.createdAtMs) / 60000)),
+        actualServiceMinutes: t.actualServiceMinutes,
+        waitMins: t.actualServiceMinutes ?? Math.max(1, Math.round(((t.completedAtMs || Date.now()) - t.createdAtMs) / 60000)),
       }));
     return {
       operator: {
         id: user.id,
         name: user.name,
         shift: user.shift || 'Day Shift',
-        todayDate: new Date().toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }),
+        todayDate: new Date().toLocaleDateString('en-IN', {
+          timeZone: 'Asia/Kolkata',
+          weekday: 'short',
+          month: 'short',
+          day: 'numeric',
+          year: 'numeric',
+        }),
       },
       facility,
       department,
       counter,
       queue,
       liveQueue,
+      pendingCheckIns,
       history,
       metrics: {
-        totalTokensToday: allFacTokens.length,
+        totalTokensToday: allFacTokens.filter((t) => (t.appointmentDate || todayIst) === todayIst).length,
         waitingTokens: liveQueue.filter((t) => ['Waiting', 'Called', 'Grace'].includes(t.status)).length,
         completedTokens: allFacTokens.filter((t) => t.status === 'Completed').length,
         skippedTokens: allFacTokens.filter((t) => t.status === 'Skipped' || t.status === 'NoShow').length,
@@ -1674,24 +2143,67 @@ export async function handleStaticApiRequest<T>(
     } as T;
   }
 
+  const opQrMatch = path.match(/^\/api\/operator\/counters\/([^/]+)\/check-in-qr$/);
+  if (opQrMatch && method === 'POST') {
+    if (user.role === 'citizen') throw new StaticApiHttpError('Forbidden.', 403);
+    const counterId = decodeURIComponent(opQrMatch[1]);
+    const counter = db.counters.find((c) => c.id === counterId);
+    if (!counter) throw new StaticApiHttpError('Counter not found.', 404);
+    const now = new Date();
+    const todayIst = getIstDateIso(now);
+    const qrPayload = String(body.qrPayload || '').trim();
+    const parts = qrPayload.startsWith('SQ:') ? qrPayload.split(':') : [];
+    const targetTokenId = parts.length >= 4 ? parts[3] : String(body.tokenId || '').trim();
+    const token = db.tokens.find((t) => t.facilityId === counter.facilityId && t.tokenId === targetTokenId);
+    if (!token) throw new StaticApiHttpError(`Token '${targetTokenId}' not found.`, 400);
+    if (diffCalendarDaysIso(token.appointmentDate || todayIst, todayIst) !== 0) {
+      throw new StaticApiHttpError('QR check-in is only permitted on the appointment date (IST).', 400);
+    }
+    token.checkedIn = true;
+    token.checkedInAt = getIstTimeFormatted(now);
+    token.checkedInAtMs = now.getTime();
+    saveDb(db);
+    const snapshot = getSnapshot(db, counter.facilityId, now)!;
+    const hydrated = snapshot.roster.find((r) => r.tokenId === token.tokenId) || hydrateTokenWithContext(db, token, todayIst, now);
+    emitStaticEvent(counter.facilityId, 'token:checked-in', { tokenId: token.tokenId, token: hydrated, snapshot });
+    return { token: hydrated, snapshot } as T;
+  }
+
   const callNextMatch = path.match(/^\/api\/operator\/counters\/([^/]+)\/call-next$/);
   if (callNextMatch && method === 'POST') {
     if (user.role === 'citizen') throw new StaticApiHttpError('Forbidden.', 403);
+    const now = new Date();
+    const todayIst = getIstDateIso(now);
     const counterId = decodeURIComponent(callNextMatch[1]);
     const counter = db.counters.find((c) => c.id === counterId);
     if (!counter) throw new StaticApiHttpError('Counter not found.', 404);
     const queue = db.queues.find((q) => q.id === counter.queueId && q.facilityId === counter.facilityId);
     if (!queue) throw new StaticApiHttpError('Queue not found.', 404);
-    const nowTime = formatNowTime();
+    const nowTime = getIstTimeFormatted(now);
     for (const t of db.tokens) {
-      if (t.facilityId === counter.facilityId && t.queueId === queue.id && (t.status === 'Serving' || t.status === 'Called')) {
+      if (
+        t.facilityId === counter.facilityId &&
+        t.queueId === queue.id &&
+        (t.appointmentDate || todayIst) === todayIst &&
+        (t.status === 'Serving' || t.status === 'Called') &&
+        (!t.counterId || t.counterId === counter.id)
+      ) {
         t.status = 'Completed';
         t.completedAt = nowTime;
+        t.completedAtMs = now.getTime();
+        t.actualServiceMinutes = Math.max(1, Math.round((now.getTime() - (t.servingStartedAtMs || t.checkedInAtMs || t.createdAtMs)) / 60000));
       }
     }
     const next = db.tokens
-      .filter((t) => t.facilityId === counter.facilityId && t.queueId === queue.id && t.status === 'Waiting')
-      .sort((a, b) => a.numberValue - b.numberValue)[0];
+      .filter(
+        (t) =>
+          t.facilityId === counter.facilityId &&
+          t.queueId === queue.id &&
+          (t.appointmentDate || todayIst) === todayIst &&
+          (typeof t.checkedIn === 'boolean' ? t.checkedIn : true) &&
+          (t.status === 'Waiting' || t.status === 'Grace')
+      )
+      .sort(compareActiveTokens)[0];
     let calledTokenId: string;
     if (next) {
       queue.servingNumber = next.numberValue;
@@ -1700,14 +2212,13 @@ export async function handleStaticApiRequest<T>(
       next.calledAt = nowTime;
       next.counterId = counter.id;
     } else {
-      queue.servingNumber += 1;
-      calledTokenId = `${queue.prefix}-${queue.servingNumber}`;
+      calledTokenId = '—';
     }
     counter.currentToken = calledTokenId;
     counter.status = 'Serving';
     db.metrics.processedDelta += 1;
     saveDb(db);
-    const snapshot = getSnapshot(db, counter.facilityId)!;
+    const snapshot = getSnapshot(db, counter.facilityId, now)!;
     emitStaticEvent(counter.facilityId, 'token:called', { calledTokenId, queueId: queue.id, snapshot });
     return { calledTokenId, queueId: queue.id, snapshot } as T;
   }
@@ -1715,13 +2226,16 @@ export async function handleStaticApiRequest<T>(
   const tokenActionMatch = path.match(/^\/api\/operator\/counters\/([^/]+)\/tokens\/([^/]+)\/([^/]+)$/);
   if (tokenActionMatch && method === 'POST') {
     if (user.role === 'citizen') throw new StaticApiHttpError('Forbidden.', 403);
+    const now = new Date();
+    const todayIst = getIstDateIso(now);
     const counterId = decodeURIComponent(tokenActionMatch[1]);
     const tokenId = decodeURIComponent(tokenActionMatch[2]);
     const action = decodeURIComponent(tokenActionMatch[3]);
     const counter = db.counters.find((c) => c.id === counterId);
     const token = db.tokens.find((t) => t.tokenId === tokenId && counter && t.facilityId === counter.facilityId);
     if (!counter || !token) throw new StaticApiHttpError('Token or counter not found.', 404);
-    const nowTime = formatNowTime();
+    const queue = db.queues.find((q) => q.id === counter.queueId && q.facilityId === counter.facilityId);
+    const nowTime = getIstTimeFormatted(now);
     const statusMap: Record<string, TokenStatus> = {
       serve: 'Serving',
       complete: 'Completed',
@@ -1735,16 +2249,45 @@ export async function handleStaticApiRequest<T>(
       token.status = statusMap[action];
       if (action === 'serve') {
         token.servingStartedAt = nowTime;
+        token.servingStartedAtMs = now.getTime();
+        token.counterId = counter.id;
         counter.currentToken = token.tokenId;
+        if (queue) queue.servingNumber = token.numberValue;
       } else {
-        if (action === 'complete') token.completedAt = nowTime;
-        if (counter.currentToken === token.tokenId) counter.currentToken = '—';
+        if (action === 'complete') {
+          token.completedAt = nowTime;
+          token.completedAtMs = now.getTime();
+          token.actualServiceMinutes = Math.max(1, Math.round((now.getTime() - (token.servingStartedAtMs || token.checkedInAtMs || token.createdAtMs)) / 60000));
+        }
+        if (db.settings.autoAdvanceOnComplete !== false && queue) {
+          const next = db.tokens
+            .filter(
+              (t) =>
+                t.facilityId === counter.facilityId &&
+                t.queueId === queue.id &&
+                (t.appointmentDate || todayIst) === todayIst &&
+                (typeof t.checkedIn === 'boolean' ? t.checkedIn : true) &&
+                (t.status === 'Waiting' || t.status === 'Grace')
+            )
+            .sort(compareActiveTokens)[0];
+          if (next) {
+            next.status = 'Called';
+            next.calledAt = nowTime;
+            next.counterId = counter.id;
+            queue.servingNumber = next.numberValue;
+            counter.currentToken = next.tokenId;
+          } else {
+            counter.currentToken = '—';
+          }
+        } else if (counter.currentToken === token.tokenId) {
+          counter.currentToken = '—';
+        }
       }
     }
     saveDb(db);
-    const snapshot = getSnapshot(db, counter.facilityId)!;
+    const snapshot = getSnapshot(db, counter.facilityId, now)!;
     emitStaticEvent(counter.facilityId, `token:${action}`, { tokenId, token, snapshot });
-    return { token, snapshot } as T;
+    return { token: hydrateTokenWithContext(db, token, todayIst, now), snapshot } as T;
   }
 
   const counterStatusMatch = path.match(/^\/api\/operator\/counters\/([^/]+)\/status$/);
@@ -1842,7 +2385,7 @@ export async function handleStaticApiRequest<T>(
 
     const liveByHr = new Map<number, number>();
     for (const tok of scopedTokens) {
-      const hr = new Date(tok.createdAtMs || Date.now()).getHours();
+      const hr = getIstHourMinute(new Date(tok.createdAtMs || Date.now())).hour;
       liveByHr.set(hr, (liveByHr.get(hr) || 0) + 1);
     }
 
@@ -2066,7 +2609,7 @@ export async function handleStaticApiRequest<T>(
 
     const liveByHr = new Map<number, number>();
     for (const tok of db.tokens.filter((t) => t.facilityId === facilityId)) {
-      const hr = new Date(tok.createdAtMs || Date.now()).getHours();
+      const hr = getIstHourMinute(new Date(tok.createdAtMs || Date.now())).hour;
       liveByHr.set(hr, (liveByHr.get(hr) || 0) + 1);
     }
 

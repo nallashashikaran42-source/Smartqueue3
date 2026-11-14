@@ -12,6 +12,7 @@ import type {
   SmartQueueDatabase,
   SystemSettingsRecord,
 } from '../models/types.ts';
+import { getIstDateIso } from '../services/istTime.ts';
 
 const DEFAULT_HOURLY_TRAFFIC: HourlyTrafficRecord[] = [
   { hour: '8 AM', footfall: 28, avgWaitMins: 8 },
@@ -30,6 +31,9 @@ export function createDefaultSettings(): SystemSettingsRecord {
     organisationName: 'Andhra Pradesh Public Health & Civic Network',
     maxActiveTokensPerCitizen: 1,
     gracePeriodMinutes: 5,
+    timezone: 'Asia/Kolkata',
+    checkInWindowBeforeMins: 120,
+    autoAdvanceOnComplete: true,
     allowPeerSwaps: true,
     enableInAppNotifications: true,
     enableSmsNotifications: true,
@@ -43,6 +47,7 @@ export function createDefaultSettings(): SystemSettingsRecord {
 export function createSeedDatabase(): SmartQueueDatabase {
   const nowIso = new Date().toISOString();
   const baseMs = Date.now();
+  const todayIst = getIstDateIso(new Date(baseMs));
 
   return {
     users: [
@@ -382,6 +387,17 @@ export function createSeedDatabase(): SmartQueueDatabase {
         avgCycleMins: 2,
       },
       {
+        id: 'c5',
+        facilityId: 'vja-hospital',
+        departmentId: 'dept-appointments',
+        label: 'Desk 5',
+        staffName: 'Dr. Madhavi Latha',
+        queueId: 'online-appointment',
+        status: 'Serving',
+        currentToken: 'Q-20',
+        avgCycleMins: 5,
+      },
+      {
         id: 'c-eseva-1',
         facilityId: 'eseva-center',
         departmentId: 'dept-eseva-civic',
@@ -632,17 +648,42 @@ export function createSeedDatabase(): SmartQueueDatabase {
         createdAtMs: baseMs - 8 * 60000,
       },
       {
+        tokenId: 'Q-20',
+        facilityId: 'vja-hospital',
+        departmentId: 'dept-appointments',
+        queueId: 'online-appointment',
+        queueName: 'Online Pre-Booked',
+        counterId: 'c5',
+        numberValue: 20,
+        citizenName: 'Prakash Rao',
+        channel: 'App QR',
+        priority: 'appointment',
+        status: 'Serving',
+        joinedAt: '10:35 AM',
+        calledAt: '10:50 AM',
+        servingStartedAt: '10:51 AM',
+        servingStartedAtMs: baseMs - 6 * 60000,
+        isPreBooked: true,
+        checkedIn: true,
+        checkedInAt: '10:35 AM',
+        checkedInAtMs: baseMs - 20 * 60000,
+        createdAtMs: baseMs - 20 * 60000,
+      },
+      {
         tokenId: 'Q-21',
         facilityId: 'vja-hospital',
         departmentId: 'dept-appointments',
         queueId: 'online-appointment',
         queueName: 'Online Pre-Booked',
+        counterId: 'c5',
         numberValue: 21,
         citizenName: 'Ayesha Begum',
         channel: 'App QR',
         priority: 'appointment',
         status: 'Waiting',
         joinedAt: '10:46 AM',
+        isPreBooked: true,
+        checkedIn: true,
         createdAtMs: baseMs - 12 * 60000,
       },
       {
@@ -813,13 +854,34 @@ class DatabaseStore {
         };
       }
     );
+    const todayIst = getIstDateIso();
+    if (!counters.some((c) => c.id === 'c5')) {
+      const c5Seed = seed.counters.find((c) => c.id === 'c5');
+      if (c5Seed) counters.push(c5Seed);
+    }
     const tokens = (parsed.tokens || seed.tokens).map((t) => {
       const q = queues.find((fq) => fq.id === t.queueId);
+      const apptDate = t.appointmentDate || getIstDateIso(new Date(t.createdAtMs || Date.now()));
+      const apptSlot = t.appointmentSlot || t.joinedAt || '08:00 AM';
+      const checkedIn = typeof t.checkedIn === 'boolean' ? t.checkedIn : true;
       return {
         ...t,
         departmentId: t.departmentId || q?.departmentId || 'dept-opd',
+        appointmentDate: apptDate,
+        appointmentSlot: apptSlot,
+        isPreBooked: typeof t.isPreBooked === 'boolean' ? t.isPreBooked : false,
+        checkedIn,
+        checkedInAt: checkedIn ? t.checkedInAt || t.joinedAt : t.checkedInAt,
+        checkedInAtMs: checkedIn ? t.checkedInAtMs || t.createdAtMs : t.checkedInAtMs,
+        qrCodePayload:
+          t.qrCodePayload || `SQ:${t.facilityId}:${t.queueId}:${t.tokenId}:${apptDate}`,
       };
     });
+    const baseSettings = createDefaultSettings();
+    const parsedSettings = parsed.settings
+      ? { ...baseSettings, ...parsed.settings, timezone: parsed.settings.timezone || 'Asia/Kolkata' }
+      : baseSettings;
+    void todayIst;
     return {
       users,
       organisations:
@@ -835,7 +897,7 @@ class DatabaseStore {
       notifications: Array.isArray(parsed.notifications) ? parsed.notifications : seed.notifications,
       auditLogs: Array.isArray(parsed.auditLogs) ? parsed.auditLogs : seed.auditLogs,
       refreshSessions: Array.isArray(parsed.refreshSessions) ? parsed.refreshSessions : [],
-      settings: parsed.settings || createDefaultSettings(),
+      settings: parsedSettings,
       hourlyTraffic: parsed.hourlyTraffic || seed.hourlyTraffic,
       metrics: parsed.metrics || seed.metrics,
     };
@@ -854,8 +916,9 @@ class DatabaseStore {
     } catch {
       // Fallback to fresh seed database if file is unreadable or corrupt
     }
-    this.persistLocal(seed);
-    return seed;
+    const normalizedSeed = this.normalizeDatabase(seed);
+    this.persistLocal(normalizedSeed);
+    return normalizedSeed;
   }
 
   async init(): Promise<void> {
@@ -912,7 +975,7 @@ class DatabaseStore {
   }
 
   reset(): SmartQueueDatabase {
-    const fresh = createSeedDatabase();
+    const fresh = this.normalizeDatabase(createSeedDatabase());
     this.data = fresh;
     this.persistLocal(this.data);
     this.queueMongoPersist();

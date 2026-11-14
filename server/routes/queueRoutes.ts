@@ -13,6 +13,7 @@ import {
   getAppointmentSlots,
   getFacilitySnapshot,
   issueToken,
+  verifyAndCheckInQr,
 } from '../services/queueEngine.ts';
 
 export const queueRoutes = Router();
@@ -50,13 +51,15 @@ queueRoutes.get('/:facilityId/slots', requireAuth, (req, res) => {
 // Issue a digital token (App QR, Missed Call, SMS, Audio Kiosk) with optional pre-booked appointment time
 queueRoutes.post('/:facilityId/tokens', requireAuth, (req, res) => {
   const { facilityId } = req.params;
-  const { queueId, channel, citizenName, appointmentDate, appointmentSlot } = req.body as {
-    queueId?: string;
-    channel?: EntryChannel;
-    citizenName?: string;
-    appointmentDate?: string;
-    appointmentSlot?: string;
-  };
+  const { queueId, channel, citizenName, appointmentDate, appointmentSlot, isPreBooked } =
+    req.body as {
+      queueId?: string;
+      channel?: EntryChannel;
+      citizenName?: string;
+      appointmentDate?: string;
+      appointmentSlot?: string;
+      isPreBooked?: boolean;
+    };
 
   if (!queueId) {
     res.status(400).json({ error: 'queueId is required to issue a token.' });
@@ -75,12 +78,58 @@ queueRoutes.post('/:facilityId/tokens', requireAuth, (req, res) => {
       userId: req.authUser?.sub,
       appointmentDate,
       appointmentSlot,
+      isPreBooked,
     });
     broadcastFacilitySnapshot(facilityId, 'token:issued', { token: result.token });
     res.status(201).json(result);
   } catch (err) {
     res.status(400).json({
       error: err instanceof Error ? err.message : 'Unable to issue token.',
+    });
+  }
+});
+
+// Verify QR payload & check in an appointment into the active queue on its appointment day (IST)
+queueRoutes.post('/:facilityId/check-in-qr', requireAuth, (req, res) => {
+  const { facilityId } = req.params;
+  const { qrPayload, tokenId, queueId, departmentId } = req.body as {
+    qrPayload?: string;
+    tokenId?: string;
+    queueId?: string;
+    departmentId?: string;
+  };
+
+  if (!qrPayload && !tokenId) {
+    res.status(400).json({ error: 'qrPayload or tokenId is required to check in.' });
+    return;
+  }
+
+  const db = dbStore.getState();
+  const actorUser = db.users.find((u) => u.id === req.authUser?.sub);
+
+  try {
+    const result = verifyAndCheckInQr({
+      facilityId,
+      qrPayload,
+      tokenId,
+      queueId,
+      departmentId,
+      actor: req.authUser
+        ? {
+            id: req.authUser.sub,
+            role: req.authUser.role,
+            name: actorUser?.name || 'Citizen',
+          }
+        : undefined,
+    });
+    broadcastFacilitySnapshot(facilityId, 'token:checked-in', {
+      tokenId: result.token.tokenId,
+      token: result.token,
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({
+      error: err instanceof Error ? err.message : 'QR check-in failed.',
     });
   }
 });

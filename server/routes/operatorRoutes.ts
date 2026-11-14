@@ -6,9 +6,12 @@ import {
   broadcastFacilitySnapshot,
   callNextAtCounter,
   getFacilitySnapshot,
+  notifyQueueDisruption,
   recordAuditLog,
   transitionTokenAtCounter,
+  verifyAndCheckInQr,
 } from '../services/queueEngine.ts';
+import { getIstDateIso } from '../services/istTime.ts';
 import { wsHub } from '../socket/wsHub.ts';
 
 export const operatorRoutes = Router();
@@ -104,15 +107,41 @@ operatorRoutes.get('/workspace', (req, res) => {
       channel: t.channel,
       priority: t.priority,
       status: t.status,
+      queueLifecycleState: t.queueLifecycleState,
+      checkedIn: t.checkedIn,
+      isPreBooked: t.isPreBooked,
+      qrCodePayload: t.qrCodePayload,
+      aheadCount: t.aheadCount,
+      waitStatusMessage: t.waitStatusMessage,
       joinedAt: t.joinedAt,
       appointmentDate: t.appointmentDate,
       appointmentSlot: t.appointmentSlot,
       calledAt: t.calledAt,
       servingStartedAt: t.servingStartedAt,
       etaMinutes: t.etaMinutes,
-      waitMinsSoFar: Math.max(0, Math.round((Date.now() - t.createdAtMs) / 60000)),
+      waitMinsSoFar: Math.max(0, Math.round((Date.now() - (t.checkedInAtMs || t.createdAtMs)) / 60000)),
       recallCount: t.recallCount || 0,
       createdAtMs: t.createdAtMs,
+    }));
+
+  const todayIst = getIstDateIso();
+  const pendingCheckIns = db.tokens
+    .filter(
+      (t) =>
+        t.facilityId === scope.facilityId &&
+        (!assignedQueue || t.queueId === assignedQueue.id) &&
+        (t.appointmentDate || todayIst) === todayIst &&
+        t.checkedIn === false &&
+        ['Waiting', 'Grace'].includes(t.status)
+    )
+    .map((t) => ({
+      tokenId: t.tokenId,
+      citizenLabel: t.citizenName,
+      queueId: t.queueId,
+      queueName: t.queueName,
+      appointmentDate: t.appointmentDate,
+      appointmentSlot: t.appointmentSlot,
+      qrCodePayload: t.qrCodePayload,
     }));
 
   const allFacilityTokens = db.tokens.filter(
@@ -124,7 +153,7 @@ operatorRoutes.get('/workspace', (req, res) => {
   const history = allFacilityTokens
     .filter((t) => ['Completed', 'Skipped', 'NoShow', 'Cancelled'].includes(t.status))
     .slice()
-    .sort((a, b) => b.createdAtMs - a.createdAtMs)
+    .sort((a, b) => (b.completedAtMs || b.createdAtMs) - (a.completedAtMs || a.createdAtMs))
     .slice(0, 50)
     .map((t) => ({
       tokenId: t.tokenId,
@@ -132,10 +161,15 @@ operatorRoutes.get('/workspace', (req, res) => {
       queueName: t.queueName,
       channel: t.channel,
       status: t.status,
+      appointmentDate: t.appointmentDate,
+      appointmentSlot: t.appointmentSlot,
       joinedAt: t.joinedAt,
       calledAt: t.calledAt,
       completedAt: t.completedAt,
-      waitMins: Math.max(1, Math.round((Date.now() - t.createdAtMs) / 60000)),
+      actualServiceMinutes: t.actualServiceMinutes,
+      waitMins:
+        t.actualServiceMinutes ??
+        Math.max(1, Math.round(((t.completedAtMs || Date.now()) - t.createdAtMs) / 60000)),
     }));
 
   const waitingTokensCount = queueTokens.filter((t) =>
@@ -151,7 +185,8 @@ operatorRoutes.get('/workspace', (req, res) => {
       id: scope.user.id,
       name: scope.user.name,
       shift: scope.user.shift || 'Day Shift',
-      todayDate: new Date().toLocaleDateString([], {
+      todayDate: new Date().toLocaleDateString('en-IN', {
+        timeZone: 'Asia/Kolkata',
         weekday: 'short',
         month: 'short',
         day: 'numeric',
@@ -163,15 +198,69 @@ operatorRoutes.get('/workspace', (req, res) => {
     counter: assignedCounter,
     queue: assignedQueue,
     liveQueue: queueTokens,
+    pendingCheckIns,
     history,
     metrics: {
-      totalTokensToday: allFacilityTokens.length,
+      totalTokensToday: allFacilityTokens.filter((t) => (t.appointmentDate || todayIst) === todayIst).length,
       waitingTokens: waitingTokensCount,
       completedTokens: completedCount,
       skippedTokens: skippedCount,
       avgWaitMins: assignedQueue?.predictedWaitMins ?? snapshot.summary.avgWaitMins,
     },
   });
+});
+
+// Verify QR payload or tokenId & check citizen into active queue from counter desk
+operatorRoutes.post('/counters/:counterId/check-in-qr', (req, res) => {
+  const { counterId } = req.params;
+  const { qrPayload, tokenId } = req.body as { qrPayload?: string; tokenId?: string };
+  if (!qrPayload && !tokenId) {
+    res.status(400).json({ error: 'qrPayload or tokenId is required to check in.' });
+    return;
+  }
+
+  const db = dbStore.getState();
+  const counter = db.counters.find((c) => c.id === counterId);
+  if (!counter) {
+    res.status(404).json({ error: 'Counter not found.' });
+    return;
+  }
+
+  const access = assertCounterAccess(
+    req.authUser!.sub,
+    req.authUser!.role,
+    counter.facilityId,
+    counterId
+  );
+  if (!access.ok) {
+    res.status(403).json({ error: access.error });
+    return;
+  }
+
+  const actorUser = db.users.find((u) => u.id === req.authUser!.sub);
+  try {
+    const result = verifyAndCheckInQr({
+      facilityId: counter.facilityId,
+      qrPayload,
+      tokenId,
+      queueId: counter.queueId,
+      departmentId: counter.departmentId,
+      actor: {
+        id: req.authUser!.sub,
+        name: actorUser?.name || 'Operator',
+        role: req.authUser!.role,
+      },
+    });
+    broadcastFacilitySnapshot(counter.facilityId, 'token:checked-in', {
+      tokenId: result.token.tokenId,
+      token: result.token,
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({
+      error: err instanceof Error ? err.message : 'Unable to check in token.',
+    });
+  }
 });
 
 // Call next waiting token at assigned counter
@@ -308,6 +397,19 @@ operatorRoutes.patch('/counters/:counterId/status', (req, res) => {
     details: `${counter.label} changed status from ${prev} to ${status}.`,
   });
 
+  if (prev !== status && (status === 'Paused' || status === 'Closed' || status === 'Serving')) {
+    notifyQueueDisruption({
+      facilityId: counter.facilityId,
+      queueId: counter.queueId,
+      title: `Counter Update · ${counter.label}`,
+      message:
+        status === 'Serving'
+          ? `${counter.label} (${counter.staffName}) is now open and serving tokens.`
+          : `${counter.label} is temporarily ${status.toLowerCase()}. Estimated wait times have been recalculated.`,
+      category: 'system',
+    });
+  }
+
   dbStore.save();
   broadcastFacilitySnapshot(counter.facilityId, 'counter:updated', { counter });
   res.json({ counter });
@@ -333,6 +435,7 @@ operatorRoutes.patch('/queues/:queueId/pause', (req, res) => {
     }
   }
 
+  const prevPaused = Boolean(queue.isPaused);
   queue.isPaused = Boolean(isPaused);
   const actorUser = db.users.find((u) => u.id === req.authUser!.sub);
   recordAuditLog({
@@ -347,6 +450,18 @@ operatorRoutes.patch('/queues/:queueId/pause', (req, res) => {
     facilityId: queue.facilityId,
     details: `${queue.name} was ${queue.isPaused ? 'paused' : 'resumed'} by operator.`,
   });
+
+  if (prevPaused !== queue.isPaused) {
+    notifyQueueDisruption({
+      facilityId: queue.facilityId,
+      queueId: queue.id,
+      title: queue.isPaused ? `Queue Delay · ${queue.name}` : `Queue Resumed · ${queue.name}`,
+      message: queue.isPaused
+        ? `${queue.name} has been temporarily paused by the operator desk.`
+        : `${queue.name} has resumed service. Live waiting times are updating.`,
+      category: 'system',
+    });
+  }
 
   dbStore.save();
   wsHub.broadcast(queue.facilityId, 'org:queue-updated', { queue });

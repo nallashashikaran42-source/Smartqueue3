@@ -16,6 +16,8 @@ import {
   ArrowRight,
   Building2,
   CalendarClock,
+  QrCode,
+  ShieldCheck,
 } from 'lucide-react';
 import {
   api,
@@ -31,6 +33,11 @@ import {
 import { FREE_TIME_ACTIVITIES, type EntryChannel } from '../../data/smartQueueData';
 import { auth, syncTicketToFirestore } from '../../firebase';
 import { useQueueSocket, type QueueWsMessage } from '../../hooks/useQueueSocket';
+import {
+  addDaysIso,
+  formatIstDateShort,
+  getIstDateIso,
+} from '../../utils/istTime';
 import { DashboardShell, type SidebarNavItem } from '../DashboardShell';
 import { NotificationsView } from '../NotificationsView';
 import { ProfileView } from '../ProfileView';
@@ -73,13 +80,13 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
   const [analyticsSummary, setAnalyticsSummary] = useState<AnalyticsSummaryResponse | null>(null);
   const [analyticsLoading, setAnalyticsLoading] = useState(false);
   const [bookingMode, setBookingMode] = useState<'walkin' | 'prebook'>('walkin');
-  const [appointmentDate, setAppointmentDate] = useState<string>(() =>
-    new Date().toISOString().slice(0, 10)
-  );
+  const [appointmentDate, setAppointmentDate] = useState<string>(() => getIstDateIso());
   const [appointmentSlot, setAppointmentSlot] = useState<string>('');
   const [slotsData, setSlotsData] = useState<AppointmentSlotsResponse | null>(null);
   const [slotsLoading, setSlotsLoading] = useState(false);
   const [activeToken, setActiveToken] = useState<ApiTokenRecord | null>(null);
+  const [showQrCheckInModal, setShowQrCheckInModal] = useState(false);
+  const [qrCheckingIn, setQrCheckingIn] = useState(false);
   const [history, setHistory] = useState<CitizenHistoryItem[]>([]);
   const [historyFilter, setHistoryFilter] = useState<'all' | 'Completed' | 'Cancelled'>('all');
 
@@ -90,16 +97,15 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
   const [loading, setLoading] = useState(true);
 
   const dateChoices = useMemo(() => {
-    const today = new Date();
-    return [0, 1, 2].map((offset) => {
-      const d = new Date(today.getTime() + offset * 86400000);
-      const iso = d.toISOString().slice(0, 10);
+    const todayIst = getIstDateIso();
+    return [0, 1, 2, 4].map((offset) => {
+      const iso = addDaysIso(todayIst, offset);
       const label =
         offset === 0
           ? 'Today'
           : offset === 1
             ? 'Tomorrow'
-            : d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+            : formatIstDateShort(iso);
       return { iso, label };
     });
   }, []);
@@ -306,6 +312,7 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
         citizenName: user.name,
         appointmentDate: isPrebookActive ? appointmentDate : undefined,
         appointmentSlot: isPrebookActive ? appointmentSlot : undefined,
+        isPreBooked: isPrebookActive,
       });
       setSnapshot(res.snapshot);
       setActiveToken(res.token);
@@ -317,9 +324,13 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
         ).catch(() => undefined);
       }
       onToast(
-        res.token.appointmentSlot
-          ? `Pre-booked ${res.token.tokenId} for ${res.token.appointmentDate} at ${res.token.appointmentSlot}`
-          : `Token ${res.token.tokenId} booked successfully`
+        res.token.queueLifecycleState === 'Upcoming Appointment'
+          ? `Appointment ${res.token.tokenId} booked for ${formatIstDateShort(
+              res.token.appointmentDate || appointmentDate
+            )}${res.token.appointmentSlot ? ` at ${res.token.appointmentSlot}` : ''}`
+          : res.token.queueLifecycleState === 'Check-In Required'
+            ? `Pre-booked ${res.token.tokenId} for today at ${res.token.appointmentSlot}. Scan QR to check in.`
+            : `Token ${res.token.tokenId} booked successfully`
       );
       await loadAll();
       onNavigate('my-queue');
@@ -327,6 +338,35 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
       onToast(err instanceof Error ? err.message : 'Unable to generate token.');
     } finally {
       setIssuing(false);
+    }
+  };
+
+  const handleConfirmQrCheckIn = async () => {
+    if (!activeToken) return;
+    setQrCheckingIn(true);
+    try {
+      const res = await api.qrCheckIn(activeToken.facilityId, {
+        qrPayload: activeToken.qrCodePayload,
+        tokenId: activeToken.tokenId,
+        queueId: activeToken.queueId,
+        departmentId: activeToken.departmentId,
+      });
+      setSnapshot(res.snapshot);
+      setActiveToken(res.token);
+      if (auth.currentUser) {
+        await syncTicketToFirestore(
+          auth.currentUser.uid,
+          res.token,
+          activeToken.facilityName || currentCenter?.facility.name || 'Service Center'
+        ).catch(() => undefined);
+      }
+      setShowQrCheckInModal(false);
+      onToast(`QR Check-in successful! Token ${res.token.tokenId} is now in the active queue.`);
+      await loadAll();
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : 'QR Check-in failed.');
+    } finally {
+      setQrCheckingIn(false);
     }
   };
 
@@ -383,10 +423,22 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
   const speakStatus = () => {
     if (!activeToken || typeof window === 'undefined' || !('speechSynthesis' in window)) return;
     window.speechSynthesis.cancel();
-    const message =
-      activeToken.status === 'Called' || activeToken.status === 'Serving'
-        ? `Token ${activeToken.tokenId}, please proceed to ${activeToken.counterLabel || 'your assigned counter'} now.`
-        : `Your token is ${activeToken.tokenId} in ${activeToken.queueName}. There are ${activeToken.aheadCount} people ahead, estimated wait ${activeToken.etaMinutes} minutes.`;
+    let message = '';
+    if (activeToken.queueLifecycleState === 'Upcoming Appointment') {
+      message = `Upcoming appointment token ${activeToken.tokenId} in ${activeToken.queueName}, scheduled for ${formatIstDateShort(
+        activeToken.appointmentDate || ''
+      )} at ${activeToken.appointmentSlot || ''}. Check-in will open on the appointment day.`;
+    } else if (activeToken.queueLifecycleState === 'Check-In Required') {
+      message = `Appointment token ${activeToken.tokenId} for ${activeToken.queueName} is ready for check-in today. Please scan your QR code to join the active queue.`;
+    } else if (activeToken.status === 'Called' || activeToken.status === 'Serving') {
+      message = `Token ${activeToken.tokenId}, please proceed to ${activeToken.counterLabel || 'your assigned counter'} now.`;
+    } else {
+      const waitPart =
+        activeToken.etaMinutes !== null
+          ? `estimated wait ${activeToken.etaMinutes} minutes`
+          : activeToken.waitStatusMessage || 'waiting time updates shortly';
+      message = `Your token is ${activeToken.tokenId} in ${activeToken.queueName}. There are ${activeToken.aheadCount ?? 0} people ahead, ${waitPart}.`;
+    }
     const utterance = new SpeechSynthesisUtterance(message);
     utterance.rate = 0.95;
     window.speechSynthesis.speak(utterance);
@@ -522,46 +574,103 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                   <div className="bg-slate-900 text-white rounded-xl p-6 flex flex-col justify-between">
                     <div className="flex items-start justify-between gap-3">
                       <div>
-                        <div className="text-xs font-medium text-blue-300">Active Digital Token</div>
+                        <div className="text-xs font-medium text-blue-300">
+                          {activeToken.queueLifecycleState === 'Upcoming Appointment'
+                            ? 'Upcoming Appointment'
+                            : activeToken.queueLifecycleState === 'Check-In Required'
+                              ? 'Check-In Required Today'
+                              : 'Active Digital Token'}
+                        </div>
                         <div className="font-mono tabular-nums text-4xl font-bold mt-1">
                           {activeToken.tokenId}
                         </div>
                         <div className="text-xs text-slate-300 mt-1">
-                          {activeToken.queueName} · {activeToken.counterLabel || 'Counter Assigned'}
+                          {activeToken.queueName}
+                          {activeToken.queueLifecycleState === 'Active Queue'
+                            ? ` · ${activeToken.counterLabel || 'Counter Assigned'}`
+                            : ''}
                         </div>
-                        {activeToken.appointmentSlot && (
+                        {(activeToken.appointmentDate || activeToken.appointmentSlot) && (
                           <div className="text-xs font-mono text-teal-300 font-semibold mt-1">
-                            Scheduled: {activeToken.appointmentDate || 'Today'} ·{' '}
-                            {activeToken.appointmentSlot}
+                            Appointment:{' '}
+                            {formatIstDateShort(activeToken.appointmentDate || getIstDateIso())}
+                            {activeToken.appointmentSlot ? ` – ${activeToken.appointmentSlot}` : ''}
                           </div>
                         )}
                       </div>
-                      <span className="font-mono text-xs uppercase text-emerald-300 font-semibold">
-                        {activeToken.status}
+                      <span className="font-mono text-xs uppercase text-emerald-300 font-semibold text-right">
+                        {activeToken.queueLifecycleState === 'Upcoming Appointment'
+                          ? 'Upcoming'
+                          : activeToken.queueLifecycleState === 'Check-In Required'
+                            ? 'Check-In Due'
+                            : activeToken.status}
                       </span>
                     </div>
 
-                    <div className="grid grid-cols-2 gap-4 py-4 my-4 border-y border-white/15 font-mono tabular-nums">
-                      <div>
-                        <div className="text-[11px] text-slate-400">People Ahead</div>
-                        <div className="text-lg font-bold mt-0.5">{activeToken.aheadCount}</div>
-                      </div>
-                      <div>
-                        <div className="text-[11px] text-slate-400">Estimated Wait</div>
-                        <div className="text-lg font-bold text-blue-300 mt-0.5">
-                          {activeToken.etaMinutes} min
+                    {activeToken.queueLifecycleState === 'Upcoming Appointment' ||
+                    activeToken.queueLifecycleState === 'Check-In Required' ? (
+                      <div className="grid grid-cols-2 gap-4 py-4 my-4 border-y border-white/15 font-mono tabular-nums">
+                        <div>
+                          <div className="text-[11px] text-slate-400">Queue Position</div>
+                          <div className="text-sm font-bold text-slate-100 mt-0.5">
+                            Not assigned yet
+                          </div>
+                          <div className="text-[11px] text-blue-300 mt-0.5">
+                            {activeToken.queueLifecycleState === 'Upcoming Appointment'
+                              ? activeToken.countdownText || 'Scheduled'
+                              : 'Scan QR on arrival'}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-[11px] text-slate-400">Estimated Wait</div>
+                          <div className="text-sm font-bold text-blue-300 mt-0.5">
+                            Available after check-in
+                          </div>
                         </div>
                       </div>
-                    </div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-4 py-4 my-4 border-y border-white/15 font-mono tabular-nums">
+                        <div>
+                          <div className="text-[11px] text-slate-400">People Ahead</div>
+                          <div className="text-lg font-bold mt-0.5">
+                            {activeToken.aheadCount ?? 0}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-[11px] text-slate-400">Estimated Wait</div>
+                          <div className="text-lg font-bold text-blue-300 mt-0.5">
+                            {activeToken.etaMinutes !== null
+                              ? `${activeToken.etaMinutes} min`
+                              : activeToken.waitStatusMessage || 'Paused'}
+                          </div>
+                        </div>
+                      </div>
+                    )}
 
-                    <button
-                      type="button"
-                      onClick={() => onNavigate('my-queue')}
-                      className="w-full inline-flex items-center justify-between px-4 py-2.5 bg-white/10 hover:bg-white/20 text-white text-xs font-semibold rounded-lg transition-colors cursor-pointer"
-                    >
-                      <span>Open Live Queue Tracker</span>
-                      <ArrowRight className="w-4 h-4" />
-                    </button>
+                    <div className="flex flex-col gap-2">
+                      {activeToken.queueLifecycleState === 'Check-In Required' && (
+                        <button
+                          type="button"
+                          onClick={() => setShowQrCheckInModal(true)}
+                          className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 bg-teal-600 hover:bg-teal-500 text-white text-xs font-semibold rounded-lg transition-colors cursor-pointer"
+                        >
+                          <QrCode className="w-4 h-4" />
+                          <span>Scan QR / Check In</span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => onNavigate('my-queue')}
+                        className="w-full inline-flex items-center justify-between px-4 py-2.5 bg-white/10 hover:bg-white/20 text-white text-xs font-semibold rounded-lg transition-colors cursor-pointer"
+                      >
+                        <span>
+                          {activeToken.queueLifecycleState === 'Upcoming Appointment'
+                            ? 'View Appointment Details'
+                            : 'Open Live Queue Tracker'}
+                        </span>
+                        <ArrowRight className="w-4 h-4" />
+                      </button>
+                    </div>
                   </div>
                 ) : (
                   <div className="bg-white border border-dashed border-slate-300 rounded-xl p-6 flex flex-col justify-between">
@@ -1043,7 +1152,7 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                         Selected Pre-Booking Schedule
                       </div>
                       <div className="font-mono tabular-nums text-sm font-bold text-slate-900">
-                        {appointmentDate} · {appointmentSlot || 'Choose a time slot'}
+                        {formatIstDateShort(appointmentDate)} · {appointmentSlot || 'Choose a time slot'}
                       </div>
                       {selectedSlotMeta && (
                         <div className="text-[11px] text-slate-600">
@@ -1169,7 +1278,9 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                               {activeToken.queueName}
                             </div>
                             <div className="text-xs text-slate-400 mt-0.5">
-                              {activeToken.counterLabel || 'Counter Assigned'} · {activeToken.channel}
+                              {activeToken.queueLifecycleState === 'Active Queue'
+                                ? `${activeToken.counterLabel || 'Counter Assigned'} · ${activeToken.channel}`
+                                : `${activeToken.departmentName || activeToken.queueName} · ${activeToken.channel}`}
                             </div>
                           </div>
                           <button
@@ -1183,52 +1294,125 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                         </div>
 
                         <div className="flex items-center justify-between gap-4 py-5 border-y border-white/15">
-                          <div>
-                            <div className="text-xs text-slate-400">Your Token Number</div>
-                            <div className="font-mono tabular-nums text-5xl font-bold mt-1">
+                          <div className="space-y-1">
+                            <div className="text-xs text-slate-400">Token Number</div>
+                            <div className="font-mono tabular-nums text-4xl sm:text-5xl font-bold">
                               {activeToken.tokenId}
                             </div>
-                            <div className="text-xs text-emerald-300 font-semibold mt-2">
-                              Status: {activeToken.status}
+                            <div className="text-xs text-emerald-300 font-semibold pt-1">
+                              Status:{' '}
+                              {activeToken.queueLifecycleState === 'Upcoming Appointment'
+                                ? 'Upcoming Appointment'
+                                : activeToken.queueLifecycleState === 'Check-In Required'
+                                  ? 'Check-In Required'
+                                  : activeToken.status}
                             </div>
-                            {activeToken.appointmentSlot && (
-                              <div className="text-xs font-mono text-teal-300 font-semibold mt-1">
-                                Appointment: {activeToken.appointmentDate || 'Today'} ·{' '}
-                                {activeToken.appointmentSlot}
+                            {(activeToken.appointmentDate || activeToken.appointmentSlot) && (
+                              <div className="text-xs font-mono text-teal-300 font-semibold">
+                                Appointment:{' '}
+                                {formatIstDateShort(activeToken.appointmentDate || getIstDateIso())}
+                                {activeToken.appointmentSlot ? ` – ${activeToken.appointmentSlot}` : ''}
+                              </div>
+                            )}
+                            {activeToken.queueLifecycleState === 'Upcoming Appointment' && (
+                              <div className="text-xs text-slate-300">
+                                Check-in: Available on appointment day
+                                {activeToken.countdownText ? ` (${activeToken.countdownText})` : ''}
+                              </div>
+                            )}
+                            {activeToken.queueLifecycleState === 'Check-In Required' && (
+                              <div className="text-xs text-amber-300 font-medium">
+                                Check-in: {activeToken.checkInStatusText || 'Ready for QR check-in'}
                               </div>
                             )}
                           </div>
                           <div className="p-2 bg-white rounded-lg shrink-0">
                             <QrTicketSvg
-                              value={`${activeToken.facilityId}:${activeToken.tokenId}:${user.name}`}
+                              value={
+                                activeToken.qrCodePayload ||
+                                `SQ:${activeToken.facilityId}:${activeToken.queueId}:${activeToken.tokenId}:${activeToken.appointmentDate || ''}`
+                              }
                               size={84}
                             />
                           </div>
                         </div>
 
-                        <div className="grid grid-cols-3 gap-3 pt-4 font-mono tabular-nums">
-                          <div>
-                            <div className="text-[11px] text-slate-400">Serving</div>
-                            <div className="text-base font-bold text-blue-300 mt-0.5">
-                              {snapshot?.queues.find((q) => q.id === activeToken.queueId)
-                                ? `${snapshot.queues.find((q) => q.id === activeToken.queueId)!.prefix}-${
-                                    snapshot.queues.find((q) => q.id === activeToken.queueId)!
-                                      .servingNumber
-                                  }`
-                                : '—'}
+                        {activeToken.queueLifecycleState === 'Upcoming Appointment' ? (
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-4 font-mono tabular-nums">
+                            <div>
+                              <div className="text-[11px] text-slate-400">Queue Status</div>
+                              <div className="text-sm font-bold text-slate-200 mt-0.5">
+                                {activeToken.queueStatusLabel || 'Not Started'}
+                              </div>
+                            </div>
+                            <div>
+                              <div className="text-[11px] text-slate-400">Queue Position</div>
+                              <div className="text-sm font-bold text-slate-200 mt-0.5">
+                                Not assigned yet
+                              </div>
+                            </div>
+                            <div>
+                              <div className="text-[11px] text-slate-400">Estimated Wait</div>
+                              <div className="text-sm font-bold text-blue-300 mt-0.5">
+                                Available after check-in
+                              </div>
                             </div>
                           </div>
-                          <div>
-                            <div className="text-[11px] text-slate-400">Ahead</div>
-                            <div className="text-base font-bold mt-0.5">{activeToken.aheadCount}</div>
+                        ) : activeToken.queueLifecycleState === 'Check-In Required' ? (
+                          <div className="space-y-4 pt-4">
+                            <div className="grid grid-cols-2 gap-3 font-mono tabular-nums">
+                              <div>
+                                <div className="text-[11px] text-slate-400">Queue Position</div>
+                                <div className="text-sm font-bold text-slate-200 mt-0.5">
+                                  Not assigned yet
+                                </div>
+                              </div>
+                              <div>
+                                <div className="text-[11px] text-slate-400">Estimated Wait</div>
+                                <div className="text-sm font-bold text-blue-300 mt-0.5">
+                                  Available after check-in
+                                </div>
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              disabled={!activeToken.checkInEligible}
+                              onClick={() => setShowQrCheckInModal(true)}
+                              className="w-full py-2.5 px-4 bg-teal-600 hover:bg-teal-500 disabled:bg-slate-700 disabled:text-slate-400 text-white text-xs font-semibold rounded-lg inline-flex items-center justify-center gap-2 transition-colors cursor-pointer disabled:cursor-not-allowed"
+                            >
+                              <QrCode className="w-4 h-4" />
+                              <span>Scan QR / Check In to Join Active Queue</span>
+                            </button>
+                            {!activeToken.checkInEligible && activeToken.checkInStatusText && (
+                              <p className="text-[11px] text-amber-300">
+                                {activeToken.checkInStatusText}
+                              </p>
+                            )}
                           </div>
-                          <div>
-                            <div className="text-[11px] text-slate-400">Est. Wait</div>
-                            <div className="text-base font-bold mt-0.5">
-                              {activeToken.etaMinutes} min
+                        ) : (
+                          <div className="grid grid-cols-3 gap-3 pt-4 font-mono tabular-nums">
+                            <div>
+                              <div className="text-[11px] text-slate-400">Serving Token</div>
+                              <div className="text-base font-bold text-blue-300 mt-0.5">
+                                {activeToken.currentServingToken || '—'}
+                              </div>
+                            </div>
+                            <div>
+                              <div className="text-[11px] text-slate-400">People Ahead</div>
+                              <div className="text-base font-bold mt-0.5">
+                                {activeToken.aheadCount ?? 0}
+                              </div>
+                            </div>
+                            <div>
+                              <div className="text-[11px] text-slate-400">Estimated Wait</div>
+                              <div className="text-base font-bold mt-0.5">
+                                {activeToken.etaMinutes !== null
+                                  ? `${activeToken.etaMinutes} min`
+                                  : activeToken.waitStatusMessage || 'Paused'}
+                              </div>
                             </div>
                           </div>
-                        </div>
+                        )}
                       </section>
 
                       {/* Queue Progress */}
@@ -1236,9 +1420,13 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                         <div className="flex items-center justify-between text-xs mb-2">
                           <span className="font-semibold text-slate-900">Queue Progress</span>
                           <span className="font-mono tabular-nums font-semibold text-blue-600">
-                            {activeToken.aheadCount === 0
-                              ? 'Your Turn'
-                              : `${activeToken.aheadCount} ahead`}
+                            {activeToken.queueLifecycleState === 'Upcoming Appointment'
+                              ? 'Not Started'
+                              : activeToken.queueLifecycleState === 'Check-In Required'
+                                ? 'Awaiting Check-In'
+                                : (activeToken.aheadCount ?? 0) === 0
+                                  ? 'Your Turn'
+                                  : `${activeToken.aheadCount ?? 0} ahead`}
                           </span>
                         </div>
                         <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
@@ -1246,9 +1434,11 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                             className="h-full bg-blue-600 rounded-full transition-all duration-300"
                             style={{
                               width: `${
-                                activeToken.aheadCount === 0
-                                  ? 100
-                                  : Math.max(15, 100 - activeToken.aheadCount * 12)
+                                activeToken.queueLifecycleState !== 'Active Queue'
+                                  ? 8
+                                  : (activeToken.aheadCount ?? 0) === 0
+                                    ? 100
+                                    : Math.max(15, 100 - (activeToken.aheadCount ?? 0) * 12)
                               }%`,
                             }}
                           />
@@ -1256,15 +1446,25 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                         <div className="flex items-center justify-between text-xs text-slate-500 mt-2">
                           <span>
                             {activeToken.appointmentSlot
-                              ? `Slot: ${activeToken.appointmentDate || 'Today'} · ${activeToken.appointmentSlot}`
+                              ? `Slot: ${formatIstDateShort(
+                                  activeToken.appointmentDate || getIstDateIso()
+                                )} · ${activeToken.appointmentSlot}`
                               : `Joined at ${activeToken.joinedAt}`}
                           </span>
-                          <span>Counter: {activeToken.counterLabel || 'Auto-assigned'}</span>
+                          <span>
+                            {activeToken.queueLifecycleState === 'Active Queue'
+                              ? `Counter: ${activeToken.counterLabel || 'Auto-assigned'}`
+                              : activeToken.checkedInAt
+                                ? `Checked in ${activeToken.checkedInAt}`
+                                : 'Check-in required'}
+                          </span>
                         </div>
                       </section>
 
                       {/* Peer Token Swap (if available) */}
-                      {snapshot && snapshot.openSwaps.some((s) => s.queueId === activeToken.queueId) && (
+                      {activeToken.queueLifecycleState === 'Active Queue' &&
+                        snapshot &&
+                        snapshot.openSwaps.some((s) => s.queueId === activeToken.queueId) && (
                         <section className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
                           <div className="flex items-center justify-between">
                             <span className="inline-flex items-center gap-1.5 text-sm font-bold text-slate-900">
@@ -1311,17 +1511,32 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                             Free-Time Planner
                           </h2>
                           <p className="text-xs text-slate-500 mt-1">
-                            Use your waiting window comfortably nearby while live turn alerts stay active.
+                            {activeToken.queueLifecycleState === 'Upcoming Appointment'
+                              ? 'Live waiting window opens after QR check-in on your appointment day.'
+                              : activeToken.queueLifecycleState === 'Check-In Required'
+                                ? 'Waiting time will be available after check-in.'
+                                : 'Use your waiting window comfortably nearby while live turn alerts stay active.'}
                           </p>
                         </div>
                         <span className="font-mono tabular-nums text-xs font-semibold text-blue-700">
-                          {Math.max(0, activeToken.etaMinutes - 3)} MIN SAFE WINDOW
+                          {activeToken.etaMinutes !== null &&
+                          activeToken.queueLifecycleState === 'Active Queue'
+                            ? `${Math.max(0, activeToken.etaMinutes - 3)} MIN SAFE WINDOW`
+                            : 'AFTER CHECK-IN'}
                         </span>
                       </div>
 
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                         {FREE_TIME_ACTIVITIES.map((act) => {
-                          const fits = act.durationMinutes <= Math.max(0, activeToken.etaMinutes - 3);
+                          const safeWaitMins =
+                            activeToken.queueLifecycleState === 'Active Queue' &&
+                            activeToken.etaMinutes !== null
+                              ? activeToken.etaMinutes
+                              : 0;
+                          const fits =
+                            activeToken.queueLifecycleState === 'Active Queue' &&
+                            activeToken.etaMinutes !== null &&
+                            act.durationMinutes <= Math.max(0, safeWaitMins - 3);
                           const chosen = selectedActivityId === act.id;
                           return (
                             <button
@@ -1350,7 +1565,13 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                               <div className="flex items-center justify-between text-xs mt-3 pt-2.5 border-t border-slate-100">
                                 <span className="text-slate-500">{act.distance}</span>
                                 <span className={fits ? 'text-emerald-700 font-semibold' : 'text-amber-700 font-semibold'}>
-                                  {chosen ? 'Selected' : fits ? 'Fits Window' : 'Tight Time'}
+                                  {chosen
+                                    ? 'Selected'
+                                    : activeToken.queueLifecycleState !== 'Active Queue'
+                                      ? 'Check-In Pending'
+                                      : fits
+                                        ? 'Fits Window'
+                                        : 'Tight Time'}
                                 </span>
                               </div>
                             </button>
@@ -1450,7 +1671,9 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                                 <div>
                                   <div className="font-semibold text-teal-800">{item.appointmentSlot}</div>
                                   <div className="text-[11px] text-slate-500">
-                                    {item.appointmentDate || item.joinedAt}
+                                    {item.appointmentDate
+                                      ? formatIstDateShort(item.appointmentDate)
+                                      : item.joinedAt}
                                   </div>
                                 </div>
                               ) : (
@@ -1458,7 +1681,12 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
                               )}
                             </td>
                             <td className="py-3 px-4 font-mono tabular-nums text-slate-600">
-                              {item.completedAt || item.cancelledAt || '—'}
+                              <div>{item.completedAt || item.cancelledAt || '—'}</div>
+                              {item.status === 'Completed' && item.actualServiceMinutes ? (
+                                <div className="text-[11px] text-emerald-700">
+                                  {item.actualServiceMinutes}m service
+                                </div>
+                              ) : null}
                             </td>
                             <td className="py-3 px-4 text-right">
                               <span className={statusBadgeStyle(item.status)}>{item.status}</span>
@@ -1481,6 +1709,102 @@ export const CitizenDashboard: React.FC<CitizenDashboardProps> = ({
               onNotify={onToast}
               onLogout={onLogout}
             />
+          )}
+
+          {/* QR Check-In Verification Modal */}
+          {showQrCheckInModal && activeToken && (
+            <div
+              role="dialog"
+              aria-modal="true"
+              className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 p-4"
+            >
+              <div className="bg-white border border-slate-200 rounded-xl max-w-md w-full p-6 space-y-5 shadow-xl">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-center gap-2.5">
+                    <div className="p-2 rounded-lg bg-teal-50 text-teal-700">
+                      <ShieldCheck className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h3 className="text-base font-bold text-slate-900">
+                        Verify QR Appointment Check-In
+                      </h3>
+                      <p className="text-xs text-slate-500">
+                        {activeToken.facilityName || currentCenter?.facility.name}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowQrCheckInModal(false)}
+                    aria-label="Close QR check-in modal"
+                    className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                <div className="flex flex-col items-center p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
+                  <div className="p-2.5 bg-white rounded-lg border border-slate-200">
+                    <QrTicketSvg
+                      value={
+                        activeToken.qrCodePayload ||
+                        `SQ:${activeToken.facilityId}:${activeToken.queueId}:${activeToken.tokenId}:${activeToken.appointmentDate || ''}`
+                      }
+                      size={128}
+                    />
+                  </div>
+                  <div className="font-mono text-xs text-slate-600 text-center break-all">
+                    {activeToken.qrCodePayload ||
+                      `SQ:${activeToken.facilityId}:${activeToken.queueId}:${activeToken.tokenId}`}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3 text-xs bg-slate-50 border border-slate-200 rounded-lg p-3.5">
+                  <div>
+                    <div className="text-slate-500">Token</div>
+                    <div className="font-mono font-bold text-slate-900 mt-0.5">
+                      {activeToken.tokenId}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-slate-500">Department / Queue</div>
+                    <div className="font-semibold text-slate-900 mt-0.5">
+                      {activeToken.queueName}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-slate-500">Appointment Date</div>
+                    <div className="font-mono font-semibold text-slate-900 mt-0.5">
+                      {formatIstDateShort(activeToken.appointmentDate || getIstDateIso())}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-slate-500">Time Slot</div>
+                    <div className="font-mono font-semibold text-teal-800 mt-0.5">
+                      {activeToken.appointmentSlot || 'Walk-in'}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setShowQrCheckInModal(false)}
+                    className="flex-1 py-2.5 px-4 border border-slate-200 text-slate-700 hover:bg-slate-50 text-xs font-semibold rounded-lg cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    disabled={qrCheckingIn}
+                    onClick={handleConfirmQrCheckIn}
+                    className="flex-1 py-2.5 px-4 bg-teal-600 hover:bg-teal-700 disabled:bg-slate-300 text-white text-xs font-semibold rounded-lg cursor-pointer"
+                  >
+                    {qrCheckingIn ? 'Verifying QR...' : 'Confirm QR Check-In'}
+                  </button>
+                </div>
+              </div>
+            </div>
           )}
         </>
       )}

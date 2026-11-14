@@ -122,6 +122,13 @@ export interface CounterRecord {
   avgCycleMins: number;
 }
 
+export type QueueLifecycleState =
+  | 'Upcoming Appointment'
+  | 'Check-In Required'
+  | 'Active Queue'
+  | 'Completed'
+  | 'Cancelled';
+
 export interface TokenRecord {
   tokenId: string;
   facilityId: string;
@@ -139,6 +146,14 @@ export interface TokenRecord {
   joinedAt: string;
   appointmentDate?: string;
   appointmentSlot?: string;
+  isPreBooked?: boolean;
+  checkedIn?: boolean;
+  checkedInAt?: string;
+  checkedInAtMs?: number;
+  servingStartedAtMs?: number;
+  completedAtMs?: number;
+  actualServiceMinutes?: number;
+  qrCodePayload?: string;
   calledAt?: string;
   servingStartedAt?: string;
   completedAt?: string;
@@ -194,6 +209,9 @@ export interface SystemSettingsRecord {
   organisationName: string;
   maxActiveTokensPerCitizen: number;
   gracePeriodMinutes: number;
+  timezone?: string;
+  checkInWindowBeforeMins?: number;
+  autoAdvanceOnComplete?: boolean;
   allowPeerSwaps: boolean;
   enableInAppNotifications: boolean;
   enableSmsNotifications: boolean;

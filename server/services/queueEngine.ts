@@ -7,18 +7,38 @@ import type {
   EntryChannel,
   NotificationCategory,
   NotificationRecord,
+  QueueLifecycleState,
+  QueuePriority,
   ServiceQueueRecord,
   SwapRequestRecord,
   TokenRecord,
   UserRole,
 } from '../models/types.ts';
 import { wsHub } from '../socket/wsHub.ts';
+import {
+  diffCalendarDaysIso,
+  formatAppointmentCountdown,
+  formatIstDateShort,
+  getIstDateIso,
+  getIstHourMinute,
+  getIstTimeFormatted,
+  parseSlotToMinutesOfDay,
+} from './istTime.ts';
 
 export interface ActorInfo {
   id: string;
   name: string;
   role: UserRole;
 }
+
+const PRIORITY_RANK: Record<QueuePriority, number> = {
+  emergency: 0,
+  senior: 1,
+  appointment: 2,
+  standard: 3,
+};
+
+const ACTIVE_TOKEN_STATUSES = new Set(['Waiting', 'Called', 'Serving', 'Grace']);
 
 export function recordAuditLog(params: {
   actor: ActorInfo;
@@ -55,8 +75,19 @@ export function pushNotification(params: {
   title: string;
   message: string;
   category: NotificationCategory;
-}): NotificationRecord {
+  dedupePrefix?: string;
+}): NotificationRecord | null {
   const db = dbStore.getState();
+  if (params.dedupePrefix && params.tokenId) {
+    const exists = db.notifications.some(
+      (n) =>
+        n.tokenId === params.tokenId &&
+        (!params.userId || n.userId === params.userId) &&
+        n.title.startsWith(params.dedupePrefix!)
+    );
+    if (exists) return null;
+  }
+
   const notif: NotificationRecord = {
     id: `notif-${crypto.randomUUID().slice(0, 8)}`,
     facilityId: params.facilityId,
@@ -92,13 +123,23 @@ export interface HydratedCounter extends CounterRecord {
 
 export interface HydratedToken extends TokenRecord {
   departmentName: string;
+  facilityName?: string;
   counterLabel?: string;
-  aheadCount: number;
-  etaMinutes: number;
+  queueLifecycleState: QueueLifecycleState;
+  bookingStatusLabel: string;
+  queueStatusLabel: string;
+  checkInEligible: boolean;
+  checkInStatusText: string;
+  countdownText: string;
+  currentServingToken: string | null;
+  aheadCount: number | null;
+  etaMinutes: number | null;
+  waitStatusMessage: string;
 }
 
 export interface FacilitySnapshot {
   facilityId: string;
+  todayIst: string;
   departments: DepartmentRecord[];
   queues: HydratedQueue[];
   counters: HydratedCounter[];
@@ -121,50 +162,374 @@ export interface FacilitySnapshot {
   };
 }
 
+/**
+ * Exact waiting-time formula:
+ * Estimated Waiting Time = (People Ahead × Average Service Time) / Number of Active Counters
+ * Returns null if the queue is paused or zero active counters are available.
+ */
 export function computeQueueWaitMins(
   queue: ServiceQueueRecord,
-  aheadOrWaiting: number,
+  aheadCount: number,
   activeCounters: number
-): number {
-  if (aheadOrWaiting <= 0) return 0;
-  const divisor = Math.max(1, activeCounters);
-  return Math.max(2, Math.round((aheadOrWaiting * queue.avgServiceMinutes) / divisor));
+): number | null {
+  if (queue.isPaused || activeCounters <= 0) return null;
+  if (aheadCount <= 0) return 0;
+  return Math.max(1, Math.round((aheadCount * queue.avgServiceMinutes) / activeCounters));
 }
 
-function formatNowTime(): string {
-  return new Date().toLocaleTimeString([], {
-    hour: 'numeric',
-    minute: '2-digit',
+function computeQueueOverviewWaitMins(
+  queue: ServiceQueueRecord,
+  waitingCount: number,
+  activeCounters: number
+): number {
+  if (waitingCount <= 0) return 0;
+  const divisor = Math.max(1, activeCounters);
+  return Math.max(1, Math.round((waitingCount * queue.avgServiceMinutes) / divisor));
+}
+
+function formatMinutesAsTime12(totalMins: number): string {
+  const clamped = ((totalMins % 1440) + 1440) % 1440;
+  const hr24 = Math.floor(clamped / 60);
+  const min = clamped % 60;
+  const meridiem = hr24 >= 12 ? 'PM' : 'AM';
+  const hr12 = hr24 % 12 === 0 ? 12 : hr24 % 12;
+  return `${hr12}:${String(min).padStart(2, '0')} ${meridiem}`;
+}
+
+function compareActiveTokens(a: TokenRecord, b: TokenRecord): number {
+  const activeScore = (t: TokenRecord) => {
+    if (t.status === 'Serving') return 0;
+    if (t.status === 'Called') return 1;
+    if (t.status === 'Grace') return 2;
+    return 3;
+  };
+  const stageDiff = activeScore(a) - activeScore(b);
+  if (stageDiff !== 0) return stageDiff;
+
+  const prioDiff = PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority];
+  if (prioDiff !== 0) return prioDiff;
+
+  const aTime = a.checkedInAtMs ?? a.createdAtMs ?? 0;
+  const bTime = b.checkedInAtMs ?? b.createdAtMs ?? 0;
+  if (aTime !== bTime) return aTime - bTime;
+
+  return a.numberValue - b.numberValue;
+}
+
+function resolveCurrentServingToken(
+  queue: ServiceQueueRecord,
+  todayTokensInQueue: TokenRecord[],
+  queueCounters: CounterRecord[]
+): string | null {
+  const activeOnDesk = todayTokensInQueue.find(
+    (t) => t.status === 'Serving' || t.status === 'Called'
+  );
+  if (activeOnDesk) return activeOnDesk.tokenId;
+
+  const counterServing = queueCounters.find(
+    (c) => (c.status === 'Serving' || c.status === 'Busy') && c.currentToken && c.currentToken !== '—'
+  );
+  if (counterServing) return counterServing.currentToken;
+
+  if (queue.servingNumber > 0) {
+    return `${queue.prefix}-${queue.servingNumber}`;
+  }
+  return null;
+}
+
+function ensureUniqueTokenId(tokens: TokenRecord[], candidate: string): string {
+  const existing = new Set(tokens.map((t) => t.tokenId));
+  if (!existing.has(candidate)) return candidate;
+  let suffix = 2;
+  while (existing.has(`${candidate}-${suffix}`)) {
+    suffix += 1;
+  }
+  return `${candidate}-${suffix}`;
+}
+
+function hydrateTokenWithContext(
+  token: TokenRecord,
+  ctx: {
+    facilityName?: string;
+    departmentName: string;
+    counterLabel?: string;
+    queue?: ServiceQueueRecord;
+    queueCounters: CounterRecord[];
+    orderedActiveTokensForQueue: TokenRecord[];
+    todayIst: string;
+    now: Date;
+    checkInWindowBeforeMins: number;
+  }
+): HydratedToken {
+  const apptDate = token.appointmentDate || getIstDateIso(new Date(token.createdAtMs || ctx.now.getTime()));
+  const apptSlot = token.appointmentSlot || token.joinedAt || '08:00 AM';
+  const checkedIn = typeof token.checkedIn === 'boolean' ? token.checkedIn : true;
+  const qrCodePayload =
+    token.qrCodePayload || `SQ:${token.facilityId}:${token.queueId}:${token.tokenId}:${apptDate}`;
+
+  if (token.status === 'Completed') {
+    const minsText = token.actualServiceMinutes
+      ? `Completed in ${token.actualServiceMinutes} min`
+      : 'Service Completed';
+    return {
+      ...token,
+      appointmentDate: apptDate,
+      appointmentSlot: apptSlot,
+      checkedIn,
+      qrCodePayload,
+      facilityName: ctx.facilityName,
+      departmentName: ctx.departmentName,
+      counterLabel: ctx.counterLabel,
+      queueLifecycleState: 'Completed',
+      bookingStatusLabel: 'Completed',
+      queueStatusLabel: 'Service Completed',
+      checkInEligible: false,
+      checkInStatusText: token.completedAt ? `Completed at ${token.completedAt} IST` : 'Completed',
+      countdownText: 'Completed',
+      currentServingToken: null,
+      aheadCount: 0,
+      etaMinutes: 0,
+      waitStatusMessage: minsText,
+    };
+  }
+
+  if (['Cancelled', 'Skipped', 'NoShow'].includes(token.status)) {
+    return {
+      ...token,
+      appointmentDate: apptDate,
+      appointmentSlot: apptSlot,
+      checkedIn,
+      qrCodePayload,
+      facilityName: ctx.facilityName,
+      departmentName: ctx.departmentName,
+      counterLabel: ctx.counterLabel,
+      queueLifecycleState: 'Cancelled',
+      bookingStatusLabel: token.status,
+      queueStatusLabel: token.status,
+      checkInEligible: false,
+      checkInStatusText: 'Closed',
+      countdownText: token.status,
+      currentServingToken: null,
+      aheadCount: null,
+      etaMinutes: null,
+      waitStatusMessage: `Token ${token.status.toLowerCase()}`,
+    };
+  }
+
+  const dayDiff = diffCalendarDaysIso(apptDate, ctx.todayIst);
+
+  // State 1: Upcoming Appointment (future IST date)
+  if (dayDiff > 0) {
+    return {
+      ...token,
+      appointmentDate: apptDate,
+      appointmentSlot: apptSlot,
+      checkedIn: false,
+      qrCodePayload,
+      facilityName: ctx.facilityName,
+      departmentName: ctx.departmentName,
+      counterLabel: ctx.counterLabel,
+      queueLifecycleState: 'Upcoming Appointment',
+      bookingStatusLabel: 'Upcoming Appointment',
+      queueStatusLabel: 'Not Started',
+      checkInEligible: false,
+      checkInStatusText: 'Available on appointment day',
+      countdownText: formatAppointmentCountdown(apptDate, ctx.todayIst),
+      currentServingToken: null,
+      aheadCount: null,
+      etaMinutes: null,
+      waitStatusMessage: 'Available after check-in',
+    };
+  }
+
+  // State 2: Same-day (or past un-checked-in) appointment awaiting QR Check-In
+  if (!checkedIn) {
+    const slotMins = parseSlotToMinutesOfDay(apptSlot);
+    const { hour, minute } = getIstHourMinute(ctx.now);
+    const nowMins = hour * 60 + minute;
+    const isExpiredDate = dayDiff < 0;
+    const withinWindow =
+      !isExpiredDate &&
+      (slotMins === null || slotMins - nowMins <= ctx.checkInWindowBeforeMins);
+    const queuePaused = Boolean(ctx.queue?.isPaused);
+
+    let checkInStatusText = 'QR check-in available now';
+    if (isExpiredDate) {
+      checkInStatusText = 'Appointment date has passed';
+    } else if (queuePaused) {
+      checkInStatusText = 'Queue temporarily paused by counter staff';
+    } else if (!withinWindow && slotMins !== null) {
+      checkInStatusText = `Check-in opens at ${formatMinutesAsTime12(
+        slotMins - ctx.checkInWindowBeforeMins
+      )} IST`;
+    }
+
+    return {
+      ...token,
+      appointmentDate: apptDate,
+      appointmentSlot: apptSlot,
+      checkedIn: false,
+      qrCodePayload,
+      facilityName: ctx.facilityName,
+      departmentName: ctx.departmentName,
+      counterLabel: ctx.counterLabel,
+      queueLifecycleState: 'Check-In Required',
+      bookingStatusLabel: isExpiredDate ? 'Expired' : 'Check-In Required',
+      queueStatusLabel: isExpiredDate ? 'Missed Appointment' : 'Awaiting Check-In',
+      checkInEligible: withinWindow && !queuePaused,
+      checkInStatusText,
+      countdownText: formatAppointmentCountdown(apptDate, ctx.todayIst),
+      currentServingToken: null,
+      aheadCount: null,
+      etaMinutes: null,
+      waitStatusMessage: 'Waiting time will be available after check-in.',
+    };
+  }
+
+  // State 3: Active Queue (Today IST + Checked-in)
+  const activeCounters = ctx.queueCounters.filter(
+    (c) => c.status === 'Serving' || c.status === 'Busy'
+  ).length;
+  const currentServingToken = ctx.queue
+    ? resolveCurrentServingToken(ctx.queue, ctx.orderedActiveTokensForQueue, ctx.queueCounters)
+    : null;
+
+  const idxInQueue = ctx.orderedActiveTokensForQueue.findIndex(
+    (t) => t.tokenId === token.tokenId
+  );
+  const aheadCount =
+    token.status === 'Serving' || token.status === 'Called'
+      ? 0
+      : idxInQueue >= 0
+        ? idxInQueue
+        : 0;
+
+  let etaMinutes: number | null = null;
+  let waitStatusMessage = 'Calculating...';
+
+  if (token.status === 'Serving' || token.status === 'Called') {
+    etaMinutes = 0;
+    waitStatusMessage = token.status === 'Serving' ? 'Now Serving' : 'Called to counter';
+  } else if (!ctx.queue) {
+    etaMinutes = null;
+    waitStatusMessage = 'Queue metadata unavailable';
+  } else if (ctx.queue.isPaused) {
+    etaMinutes = null;
+    waitStatusMessage = 'Queue paused by counter staff';
+  } else if (activeCounters <= 0) {
+    etaMinutes = null;
+    waitStatusMessage = 'Waiting for active counter staff';
+  } else {
+    etaMinutes = computeQueueWaitMins(ctx.queue, aheadCount, activeCounters);
+    waitStatusMessage =
+      etaMinutes === 0 ? 'Next in line' : `${etaMinutes} minute${etaMinutes === 1 ? '' : 's'}`;
+  }
+
+  return {
+    ...token,
+    appointmentDate: apptDate,
+    appointmentSlot: apptSlot,
+    checkedIn: true,
+    qrCodePayload,
+    facilityName: ctx.facilityName,
+    departmentName: ctx.departmentName,
+    counterLabel: ctx.counterLabel,
+    queueLifecycleState: 'Active Queue',
+    bookingStatusLabel: token.status,
+    queueStatusLabel: token.status,
+    checkInEligible: false,
+    checkInStatusText: token.checkedInAt ? `Checked in at ${token.checkedInAt} IST` : 'Checked in',
+    countdownText: 'Today',
+    currentServingToken,
+    aheadCount,
+    etaMinutes,
+    waitStatusMessage,
+  };
+}
+
+export function hydrateTokenForCitizen(
+  token: TokenRecord,
+  now: Date = new Date()
+): HydratedToken {
+  const db = dbStore.getState();
+  const todayIst = getIstDateIso(now);
+  const facility = db.facilities.find((f) => f.id === token.facilityId);
+  const dept = db.departments.find((d) => d.id === token.departmentId);
+  const queue = db.queues.find((q) => q.id === token.queueId && q.facilityId === token.facilityId);
+  const queueCounters = db.counters.filter(
+    (c) => c.facilityId === token.facilityId && c.queueId === token.queueId
+  );
+  const counter =
+    queueCounters.find((c) => c.id === token.counterId) ||
+    queueCounters.find((c) => c.status !== 'Closed') ||
+    queueCounters[0];
+
+  const orderedActiveTokensForQueue = db.tokens
+    .filter(
+      (t) =>
+        t.facilityId === token.facilityId &&
+        t.queueId === token.queueId &&
+        (t.appointmentDate || todayIst) === todayIst &&
+        (typeof t.checkedIn === 'boolean' ? t.checkedIn : true) &&
+        ACTIVE_TOKEN_STATUSES.has(t.status)
+    )
+    .slice()
+    .sort(compareActiveTokens);
+
+  return hydrateTokenWithContext(token, {
+    facilityName: facility?.name,
+    departmentName: dept?.name || 'General Services',
+    counterLabel: counter?.label,
+    queue,
+    queueCounters,
+    orderedActiveTokensForQueue,
+    todayIst,
+    now,
+    checkInWindowBeforeMins: db.settings.checkInWindowBeforeMins ?? 120,
   });
 }
 
-export function getFacilitySnapshot(facilityId: string): FacilitySnapshot | null {
+export function getFacilitySnapshot(
+  facilityId: string,
+  now: Date = new Date()
+): FacilitySnapshot | null {
   const db = dbStore.getState();
   const facility = db.facilities.find((f) => f.id === facilityId);
   if (!facility) return null;
 
+  const todayIst = getIstDateIso(now);
   const facilityDepartments = db.departments.filter((d) => d.facilityId === facilityId);
   const facilityQueues = db.queues.filter((q) => q.facilityId === facilityId);
   const facilityCounters = db.counters.filter((c) => c.facilityId === facilityId);
-  const facilityTokens = db.tokens.filter(
+
+  // Strictly isolate active queue to tokens scheduled for TODAY (IST) AND checked in
+  const activeTodayCheckedIn = db.tokens.filter(
     (t) =>
       t.facilityId === facilityId &&
-      ['Waiting', 'Called', 'Serving', 'Grace'].includes(t.status)
+      (t.appointmentDate || todayIst) === todayIst &&
+      (typeof t.checkedIn === 'boolean' ? t.checkedIn : true) &&
+      ACTIVE_TOKEN_STATUSES.has(t.status)
   );
+
+  const orderedByQueue = new Map<string, TokenRecord[]>();
+  for (const q of facilityQueues) {
+    const queueTokens = activeTodayCheckedIn
+      .filter((t) => t.queueId === q.id)
+      .slice()
+      .sort(compareActiveTokens);
+    orderedByQueue.set(q.id, queueTokens);
+  }
 
   const hydratedQueues: HydratedQueue[] = facilityQueues.map((q) => {
     const dept = facilityDepartments.find((d) => d.id === q.departmentId);
     const activeCounters = facilityCounters.filter(
       (c) => c.queueId === q.id && (c.status === 'Serving' || c.status === 'Busy')
     ).length;
-    const waitingTokens = facilityTokens.filter(
-      (t) =>
-        t.queueId === q.id &&
-        (t.status === 'Waiting' || t.status === 'Called' || t.status === 'Grace')
-    );
-    const spreadCount = Math.max(0, q.nextIssueNumber - q.servingNumber - 1);
-    const waitingCount = Math.max(waitingTokens.length, spreadCount);
-    const predictedWaitMins = computeQueueWaitMins(q, waitingCount, activeCounters);
+    const queueActive = orderedByQueue.get(q.id) || [];
+    const waitingCount = queueActive.filter((t) =>
+      ['Waiting', 'Called', 'Grace'].includes(t.status)
+    ).length;
+    const predictedWaitMins = computeQueueOverviewWaitMins(q, waitingCount, activeCounters);
 
     return {
       ...q,
@@ -185,27 +550,30 @@ export function getFacilitySnapshot(facilityId: string): FacilitySnapshot | null
     };
   });
 
-  const hydratedRoster: HydratedToken[] = facilityTokens
+  const checkInWindowBeforeMins = db.settings.checkInWindowBeforeMins ?? 120;
+  const hydratedRoster: HydratedToken[] = activeTodayCheckedIn
     .slice()
-    .sort((a, b) => a.numberValue - b.numberValue)
+    .sort(compareActiveTokens)
     .map((t) => {
       const q = hydratedQueues.find((hq) => hq.id === t.queueId);
       const dept = facilityDepartments.find((d) => d.id === (t.departmentId || q?.departmentId));
-      const cnt = facilityCounters.find(
-        (c) => c.id === t.counterId || (c.queueId === t.queueId && c.status !== 'Closed')
-      );
-      const aheadCount = q ? Math.max(0, t.numberValue - q.servingNumber) : 0;
-      const etaMinutes =
-        t.status === 'Serving' || t.status === 'Called' || !q
-          ? 0
-          : computeQueueWaitMins(q, aheadCount, q.activeCounters);
-      return {
-        ...t,
+      const queueCounters = facilityCounters.filter((c) => c.queueId === t.queueId);
+      const cnt =
+        queueCounters.find((c) => c.id === t.counterId) ||
+        queueCounters.find((c) => c.status !== 'Closed') ||
+        queueCounters[0];
+
+      return hydrateTokenWithContext(t, {
+        facilityName: facility.name,
         departmentName: dept?.name || 'General Services',
         counterLabel: cnt?.label,
-        aheadCount,
-        etaMinutes,
-      };
+        queue: q,
+        queueCounters,
+        orderedActiveTokensForQueue: orderedByQueue.get(t.queueId) || [],
+        todayIst,
+        now,
+        checkInWindowBeforeMins,
+      });
     });
 
   const openSwaps = db.swaps.filter(
@@ -240,6 +608,7 @@ export function getFacilitySnapshot(facilityId: string): FacilitySnapshot | null
 
   return {
     facilityId,
+    todayIst,
     departments: facilityDepartments,
     queues: hydratedQueues,
     counters: hydratedCounters,
@@ -256,11 +625,99 @@ export function getFacilitySnapshot(facilityId: string): FacilitySnapshot | null
   };
 }
 
-export function broadcastFacilitySnapshot(facilityId: string, event: string, extra?: Record<string, unknown>) {
+export function broadcastFacilitySnapshot(
+  facilityId: string,
+  event: string,
+  extra?: Record<string, unknown>
+) {
   const snapshot = getFacilitySnapshot(facilityId);
   if (!snapshot) return;
   wsHub.broadcast(facilityId, event, { ...extra, snapshot });
   wsHub.broadcast('all', event, { facilityId, ...extra, snapshot });
+}
+
+export function syncCitizenAppointmentNotifications(
+  userId: string,
+  now: Date = new Date()
+): void {
+  const db = dbStore.getState();
+  const todayIst = getIstDateIso(now);
+  let mutated = false;
+
+  for (const token of db.tokens) {
+    if (token.userId !== userId) continue;
+    if (!['Waiting', 'Grace'].includes(token.status)) continue;
+    const apptDate = token.appointmentDate || todayIst;
+    const diff = diffCalendarDaysIso(apptDate, todayIst);
+
+    if (diff === 1) {
+      const created = pushNotification({
+        facilityId: token.facilityId,
+        userId,
+        tokenId: token.tokenId,
+        dedupePrefix: 'Appointment Reminder',
+        title: `Appointment Reminder · ${token.tokenId}`,
+        message: `Your appointment in ${token.queueName} is tomorrow (${formatIstDateShort(
+          apptDate
+        )}${token.appointmentSlot ? ` at ${token.appointmentSlot}` : ''} IST).`,
+        category: 'token',
+      });
+      if (created) mutated = true;
+    } else if (diff === 0 && !token.checkedIn) {
+      const created = pushNotification({
+        facilityId: token.facilityId,
+        userId,
+        tokenId: token.tokenId,
+        dedupePrefix: 'Check-In Available',
+        title: `Check-In Available · ${token.tokenId}`,
+        message: `Your appointment today (${token.appointmentSlot || 'Scheduled'}) is ready for QR check-in at ${token.queueName}.`,
+        category: 'token',
+      });
+      if (created) mutated = true;
+    }
+  }
+
+  if (mutated) {
+    dbStore.save();
+  }
+}
+
+export function notifyQueueDisruption(params: {
+  facilityId: string;
+  queueId: string;
+  title: string;
+  message: string;
+  category?: NotificationCategory;
+}): void {
+  const db = dbStore.getState();
+  const todayIst = getIstDateIso();
+  const affected = db.tokens.filter(
+    (t) =>
+      t.facilityId === params.facilityId &&
+      t.queueId === params.queueId &&
+      (t.appointmentDate || todayIst) === todayIst &&
+      (typeof t.checkedIn === 'boolean' ? t.checkedIn : true) &&
+      ['Waiting', 'Called', 'Grace'].includes(t.status)
+  );
+  if (affected.length === 0) {
+    pushNotification({
+      facilityId: params.facilityId,
+      title: params.title,
+      message: params.message,
+      category: params.category || 'system',
+    });
+    return;
+  }
+  for (const tok of affected) {
+    pushNotification({
+      facilityId: params.facilityId,
+      userId: tok.userId,
+      tokenId: tok.tokenId,
+      title: `${params.title} · ${tok.tokenId}`,
+      message: params.message,
+      category: params.category || 'system',
+    });
+  }
 }
 
 const PREBOOK_SLOT_TEMPLATES = [
@@ -304,18 +761,21 @@ export interface AppointmentSlotsResult {
   slots: AppointmentSlotItem[];
 }
 
-export function normalizeAppointmentDate(date?: string): string {
+export function normalizeAppointmentDate(date?: string, now: Date = new Date()): string {
   if (date && /^\d{4}-\d{2}-\d{2}$/.test(date.trim())) {
     return date.trim();
   }
-  return new Date().toISOString().slice(0, 10);
+  return getIstDateIso(now);
 }
 
-export function getAppointmentSlots(params: {
-  facilityId: string;
-  queueId: string;
-  date?: string;
-}): AppointmentSlotsResult | null {
+export function getAppointmentSlots(
+  params: {
+    facilityId: string;
+    queueId: string;
+    date?: string;
+  },
+  now: Date = new Date()
+): AppointmentSlotsResult | null {
   const db = dbStore.getState();
   const facility = db.facilities.find((f) => f.id === params.facilityId);
   const queue = db.queues.find(
@@ -323,7 +783,7 @@ export function getAppointmentSlots(params: {
   );
   if (!facility || !queue) return null;
 
-  const targetDate = normalizeAppointmentDate(params.date);
+  const targetDate = normalizeAppointmentDate(params.date, now);
   const activeCountersForQueue = Math.max(
     1,
     db.counters.filter(
@@ -356,7 +816,13 @@ export function getAppointmentSlots(params: {
     const remainingSpots = Math.max(0, maxCapacity - bookedCount);
     const hrMeta = hourlyMap.get(tpl.hourLabel);
     const isPeak = hrMeta ? hrMeta.isPeak : tpl.hourLabel === '10 AM' || tpl.hourLabel === '11 AM';
-    const isBestTime = hrMeta ? hrMeta.isRecommended : !isPeak && (tpl.hourLabel === '8 AM' || tpl.hourLabel === '1 PM' || tpl.hourLabel === '2 PM' || tpl.hourLabel === '3 PM');
+    const isBestTime = hrMeta
+      ? hrMeta.isRecommended
+      : !isPeak &&
+        (tpl.hourLabel === '8 AM' ||
+          tpl.hourLabel === '1 PM' ||
+          tpl.hourLabel === '2 PM' ||
+          tpl.hourLabel === '3 PM');
     const crowdLevel: CrowdLevel = hrMeta
       ? hrMeta.crowdLevel
       : isPeak
@@ -393,16 +859,22 @@ export function getAppointmentSlots(params: {
   };
 }
 
-export function issueToken(params: {
-  facilityId: string;
-  queueId: string;
-  channel: EntryChannel;
-  citizenName?: string;
-  userId?: string;
-  appointmentDate?: string;
-  appointmentSlot?: string;
-}): { token: HydratedToken; snapshot: FacilitySnapshot } {
+export function issueToken(
+  params: {
+    facilityId: string;
+    queueId: string;
+    channel: EntryChannel;
+    citizenName?: string;
+    userId?: string;
+    appointmentDate?: string;
+    appointmentSlot?: string;
+    isPreBooked?: boolean;
+  },
+  now: Date = new Date()
+): { token: HydratedToken; snapshot: FacilitySnapshot } {
   const db = dbStore.getState();
+  const todayIst = getIstDateIso(now);
+
   const facility = db.facilities.find((f) => f.id === params.facilityId);
   if (!facility || !facility.isActive) {
     throw new Error('Selected service center is currently unavailable.');
@@ -423,7 +895,7 @@ export function issueToken(params: {
     const activeForUser = db.tokens.filter(
       (t) =>
         t.userId === params.userId &&
-        ['Waiting', 'Called', 'Serving', 'Grace'].includes(t.status)
+        ACTIVE_TOKEN_STATUSES.has(t.status)
     );
     const maxAllowed = Math.max(1, db.settings.maxActiveTokensPerCitizen || 1);
     if (activeForUser.length >= maxAllowed) {
@@ -433,37 +905,83 @@ export function issueToken(params: {
     }
   }
 
-  let normalizedDate: string | undefined;
-  let normalizedSlot: string | undefined;
-  if (params.appointmentSlot && params.appointmentSlot.trim()) {
-    normalizedSlot = params.appointmentSlot.trim();
-    normalizedDate = normalizeAppointmentDate(params.appointmentDate);
-    const slotInfo = getAppointmentSlots({
-      facilityId: params.facilityId,
-      queueId: queue.id,
-      date: normalizedDate,
-    });
-    const matched = slotInfo?.slots.find((s) => s.slot === normalizedSlot);
-    if (!matched) {
-      throw new Error(`Selected appointment time '${normalizedSlot}' is not valid for this service center.`);
-    }
-    if (!matched.isAvailable) {
-      throw new Error(`Time slot ${normalizedSlot} on ${normalizedDate} is already full. Please select another slot.`);
-    }
-  } else if (queue.priority === 'appointment' && params.appointmentDate) {
-    normalizedDate = normalizeAppointmentDate(params.appointmentDate);
+  const targetDate = normalizeAppointmentDate(params.appointmentDate, now);
+  if (diffCalendarDaysIso(targetDate, todayIst) < 0) {
+    throw new Error('Cannot book an appointment for a past date.');
   }
 
-  const numberValue = queue.nextIssueNumber;
-  queue.nextIssueNumber += 1;
+  let normalizedSlot = params.appointmentSlot?.trim() || undefined;
+  if (normalizedSlot) {
+    const slotInfo = getAppointmentSlots(
+      {
+        facilityId: params.facilityId,
+        queueId: queue.id,
+        date: targetDate,
+      },
+      now
+    );
+    const matched = slotInfo?.slots.find((s) => s.slot === normalizedSlot);
+    if (!matched) {
+      throw new Error(
+        `Selected appointment time '${normalizedSlot}' is not valid for this service center.`
+      );
+    }
+    if (!matched.isAvailable) {
+      throw new Error(
+        `Time slot ${normalizedSlot} on ${targetDate} is already full. Please select another slot.`
+      );
+    }
+  }
+
+  const isFutureDate = diffCalendarDaysIso(targetDate, todayIst) > 0;
+  const isPreBooked =
+    typeof params.isPreBooked === 'boolean'
+      ? params.isPreBooked
+      : Boolean(normalizedSlot || isFutureDate || queue.priority === 'appointment');
+
+  if (isPreBooked && !normalizedSlot) {
+    normalizedSlot = '08:00 AM';
+  }
+
+  // Walk-ins on today's IST date enter the active queue immediately; pre-booked tokens require QR check-in
+  const checkedIn = !isPreBooked && !isFutureDate;
+  const joinedAt = getIstTimeFormatted(now);
+
+  // Per-(facility, queue, date) isolated token numbering so future dates never pollute today's queue sequence
+  const sameDateQueueTokens = db.tokens.filter(
+    (t) =>
+      t.facilityId === params.facilityId &&
+      t.queueId === queue.id &&
+      (t.appointmentDate || todayIst) === targetDate
+  );
+
+  let numberValue: number;
+  let rawTokenId: string;
+  if (targetDate === todayIst) {
+    const maxTodayNumber = sameDateQueueTokens.reduce(
+      (max, t) => Math.max(max, t.numberValue),
+      queue.servingNumber
+    );
+    numberValue = Math.max(queue.nextIssueNumber, maxTodayNumber + 1);
+    queue.nextIssueNumber = numberValue + 1;
+    rawTokenId = `${queue.prefix}-${numberValue}`;
+  } else {
+    const maxFutureNumber = sameDateQueueTokens.reduce(
+      (max, t) => Math.max(max, t.numberValue),
+      0
+    );
+    numberValue = maxFutureNumber + 1;
+    const mmdd = `${targetDate.slice(5, 7)}${targetDate.slice(8, 10)}`;
+    rawTokenId = `${queue.prefix}-${mmdd}-${numberValue}`;
+  }
+
+  const tokenId = ensureUniqueTokenId(db.tokens, rawTokenId);
+  const qrCodePayload = `SQ:${facility.id}:${queue.id}:${tokenId}:${targetDate}`;
 
   const assignedCounter =
     db.counters.find(
       (c) => c.facilityId === params.facilityId && c.queueId === queue.id && c.status !== 'Closed'
     ) || db.counters.find((c) => c.facilityId === params.facilityId && c.queueId === queue.id);
-
-  const tokenId = `${queue.prefix}-${numberValue}`;
-  const joinedAt = formatNowTime();
 
   const token: TokenRecord = {
     tokenId,
@@ -480,36 +998,224 @@ export function issueToken(params: {
     priority: queue.priority,
     status: 'Waiting',
     joinedAt,
-    appointmentDate: normalizedDate,
-    appointmentSlot: normalizedSlot,
-    createdAtMs: Date.now(),
+    appointmentDate: targetDate,
+    appointmentSlot: normalizedSlot || joinedAt,
+    isPreBooked,
+    checkedIn,
+    checkedInAt: checkedIn ? joinedAt : undefined,
+    checkedInAtMs: checkedIn ? now.getTime() : undefined,
+    qrCodePayload,
+    createdAtMs: now.getTime(),
   };
 
   db.tokens.push(token);
-  db.metrics.processedDelta += 1;
+  if (checkedIn) {
+    db.metrics.processedDelta += 1;
+  }
+
   pushNotification({
     facilityId: params.facilityId,
     userId: params.userId,
     tokenId: token.tokenId,
-    title: normalizedSlot
-      ? `Pre-Booked ${token.tokenId} · ${normalizedSlot}`
+    title: isPreBooked
+      ? `Appointment Confirmed · ${token.tokenId}`
       : `Token ${token.tokenId} Confirmed`,
-    message: normalizedSlot
-      ? `Reserved in ${queue.name} for ${normalizedDate} at ${normalizedSlot} (${queue.location}) at ${facility.name} via ${params.channel}.`
-      : `Reserved in ${queue.name} (${queue.location}) at ${facility.name} via ${params.channel}.`,
+    message: isPreBooked
+      ? `Reserved in ${queue.name} for ${formatIstDateShort(targetDate)}${
+          normalizedSlot ? ` at ${normalizedSlot} IST` : ''
+        } (${queue.location}) at ${facility.name}. Scan QR on appointment day to check in.`
+      : `Checked in to ${queue.name} (${queue.location}) at ${facility.name} via ${params.channel}.`,
     category: 'token',
   });
+
+  if (params.userId) {
+    const diff = diffCalendarDaysIso(targetDate, todayIst);
+    if (diff === 1) {
+      pushNotification({
+        facilityId: params.facilityId,
+        userId: params.userId,
+        tokenId: token.tokenId,
+        dedupePrefix: 'Appointment Reminder',
+        title: `Appointment Reminder · ${token.tokenId}`,
+        message: `Reminder: Your appointment at ${facility.name} is tomorrow (${formatIstDateShort(
+          targetDate
+        )} at ${normalizedSlot || joinedAt} IST).`,
+        category: 'token',
+      });
+    } else if (diff === 0 && !checkedIn) {
+      pushNotification({
+        facilityId: params.facilityId,
+        userId: params.userId,
+        tokenId: token.tokenId,
+        dedupePrefix: 'Check-In Available',
+        title: `Check-In Available · ${token.tokenId}`,
+        message: `Your appointment today (${normalizedSlot || joinedAt}) can be checked in via QR to enter the live queue.`,
+        category: 'token',
+      });
+    }
+  }
+
   dbStore.save();
 
-  const snapshot = getFacilitySnapshot(params.facilityId)!;
-  const hydrated = snapshot.roster.find((r) => r.tokenId === token.tokenId)!;
+  const snapshot = getFacilitySnapshot(params.facilityId, now)!;
+  const hydrated = hydrateTokenForCitizen(token, now);
   return { token: hydrated, snapshot };
+}
+
+export function verifyAndCheckInQr(
+  params: {
+    facilityId?: string;
+    qrPayload?: string;
+    tokenId?: string;
+    departmentId?: string;
+    queueId?: string;
+    actor?: ActorInfo;
+  },
+  now: Date = new Date()
+): { token: HydratedToken; snapshot: FacilitySnapshot } {
+  const db = dbStore.getState();
+  const todayIst = getIstDateIso(now);
+
+  let targetFacilityId = params.facilityId?.trim();
+  let targetQueueId = params.queueId?.trim();
+  let targetTokenId = params.tokenId?.trim();
+
+  if (params.qrPayload && params.qrPayload.trim()) {
+    const raw = params.qrPayload.trim();
+    if (raw.startsWith('SQ:')) {
+      const parts = raw.split(':');
+      if (parts.length < 4) {
+        throw new Error('Invalid QR code format.');
+      }
+      targetFacilityId = targetFacilityId || parts[1];
+      targetQueueId = targetQueueId || parts[2];
+      targetTokenId = targetTokenId || parts[3];
+    } else if (raw.includes(':')) {
+      const parts = raw.split(':');
+      targetFacilityId = targetFacilityId || parts[0];
+      targetTokenId = targetTokenId || parts[1];
+    } else {
+      targetTokenId = targetTokenId || raw;
+    }
+  }
+
+  if (!targetTokenId) {
+    throw new Error('Token ID or QR payload is required to check in.');
+  }
+
+  const token = db.tokens.find(
+    (t) =>
+      t.tokenId.toLowerCase() === targetTokenId!.toLowerCase() &&
+      (!targetFacilityId || t.facilityId === targetFacilityId)
+  );
+  if (!token) {
+    throw new Error(`Token '${targetTokenId}' was not found for this service center.`);
+  }
+
+  if (params.actor?.role === 'citizen' && token.userId && token.userId !== params.actor.id) {
+    throw new Error('You can only check in your own appointment token.');
+  }
+  if (params.departmentId && token.departmentId !== params.departmentId) {
+    throw new Error('QR token belongs to a different department.');
+  }
+  if (targetQueueId && token.queueId !== targetQueueId) {
+    throw new Error('QR token belongs to a different service queue.');
+  }
+  if (['Completed', 'Cancelled', 'Skipped', 'NoShow'].includes(token.status)) {
+    throw new Error(`Cannot check in token '${token.tokenId}' because it is ${token.status}.`);
+  }
+
+  const queue = db.queues.find(
+    (q) => q.id === token.queueId && q.facilityId === token.facilityId
+  );
+  if (!queue || !queue.isActive) {
+    throw new Error('Assigned service queue is inactive.');
+  }
+  if (queue.isPaused) {
+    throw new Error(`Queue '${queue.name}' is currently paused. Check-in will resume shortly.`);
+  }
+
+  const apptDate = token.appointmentDate || todayIst;
+  const dayDiff = diffCalendarDaysIso(apptDate, todayIst);
+
+  if (dayDiff > 0) {
+    throw new Error(
+      `Check-in is only available on your appointment date (${formatIstDateShort(
+        apptDate
+      )} IST). Early check-in is not allowed.`
+    );
+  }
+  if (dayDiff < 0) {
+    throw new Error(
+      `Appointment date (${formatIstDateShort(apptDate)}) has already passed.`
+    );
+  }
+
+  if (token.checkedIn) {
+    const snapshot = getFacilitySnapshot(token.facilityId, now)!;
+    return { token: hydrateTokenForCitizen(token, now), snapshot };
+  }
+
+  const windowBeforeMins = db.settings.checkInWindowBeforeMins ?? 120;
+  const slotMins = token.appointmentSlot ? parseSlotToMinutesOfDay(token.appointmentSlot) : null;
+  if (slotMins !== null) {
+    const { hour, minute } = getIstHourMinute(now);
+    const nowMins = hour * 60 + minute;
+    if (slotMins - nowMins > windowBeforeMins) {
+      throw new Error(
+        `Check-in window for ${token.appointmentSlot} opens at ${formatMinutesAsTime12(
+          slotMins - windowBeforeMins
+        )} IST.`
+      );
+    }
+  }
+
+  const nowTime = getIstTimeFormatted(now);
+  token.checkedIn = true;
+  token.checkedInAt = nowTime;
+  token.checkedInAtMs = now.getTime();
+
+  const assignedCounter =
+    db.counters.find(
+      (c) => c.facilityId === token.facilityId && c.queueId === queue.id && c.status !== 'Closed'
+    ) || db.counters.find((c) => c.facilityId === token.facilityId && c.queueId === queue.id);
+  if (assignedCounter && !token.counterId) {
+    token.counterId = assignedCounter.id;
+    token.assignedOperatorId = assignedCounter.assignedOperatorId;
+  }
+
+  db.metrics.processedDelta += 1;
+
+  pushNotification({
+    facilityId: token.facilityId,
+    userId: token.userId,
+    tokenId: token.tokenId,
+    title: `Check-In Successful · ${token.tokenId}`,
+    message: `You are now checked in to ${queue.name} (${queue.location}). Live waiting time is active.`,
+    category: 'token',
+  });
+
+  if (params.actor) {
+    recordAuditLog({
+      actor: params.actor,
+      action: 'TOKEN_QR_CHECKED_IN',
+      targetType: 'token',
+      targetId: token.tokenId,
+      facilityId: token.facilityId,
+      details: `Verified QR check-in for ${token.tokenId} in ${queue.name} (${apptDate}).`,
+    });
+  }
+
+  dbStore.save();
+  const snapshot = getFacilitySnapshot(token.facilityId, now)!;
+  return { token: hydrateTokenForCitizen(token, now), snapshot };
 }
 
 export function cancelToken(
   facilityId: string,
   tokenId: string,
-  actor?: { id: string; role: UserRole; name: string }
+  actor?: { id: string; role: UserRole; name: string },
+  now: Date = new Date()
 ): FacilitySnapshot {
   const db = dbStore.getState();
   const token = db.tokens.find(
@@ -526,14 +1232,20 @@ export function cancelToken(
   }
 
   token.status = 'Cancelled';
-  token.cancelledAt = formatNowTime();
+  token.cancelledAt = getIstTimeFormatted(now);
+
+  for (const cnt of db.counters) {
+    if (cnt.facilityId === facilityId && cnt.currentToken === token.tokenId) {
+      cnt.currentToken = '—';
+    }
+  }
 
   pushNotification({
     facilityId,
     userId: token.userId,
     tokenId: token.tokenId,
     title: `Token ${token.tokenId} Cancelled`,
-    message: `Your slot in ${token.queueName} was cancelled and queue capacity has been released.`,
+    message: `Your appointment in ${token.queueName} was cancelled and queue capacity has been released.`,
     category: 'token',
   });
 
@@ -549,19 +1261,86 @@ export function cancelToken(
   }
 
   dbStore.save();
-  return getFacilitySnapshot(facilityId)!;
+  return getFacilitySnapshot(facilityId, now)!;
+}
+
+function promoteNextCheckedInToken(params: {
+  facilityId: string;
+  queue: ServiceQueueRecord;
+  counter: CounterRecord;
+  actor?: ActorInfo;
+  now: Date;
+}): TokenRecord | null {
+  const db = dbStore.getState();
+  const todayIst = getIstDateIso(params.now);
+  const nowTime = getIstTimeFormatted(params.now);
+
+  const candidates = db.tokens
+    .filter(
+      (t) =>
+        t.facilityId === params.facilityId &&
+        t.queueId === params.queue.id &&
+        (t.appointmentDate || todayIst) === todayIst &&
+        (typeof t.checkedIn === 'boolean' ? t.checkedIn : true) &&
+        t.status === 'Waiting'
+    )
+    .slice()
+    .sort(compareActiveTokens);
+
+  if (candidates.length === 0) {
+    params.counter.currentToken = '—';
+    return null;
+  }
+
+  const nextToken = candidates[0];
+  params.queue.servingNumber = nextToken.numberValue;
+  nextToken.status = 'Called';
+  nextToken.calledAt = nowTime;
+  nextToken.counterId = params.counter.id;
+  nextToken.assignedOperatorId = params.actor?.id || params.counter.assignedOperatorId;
+  params.counter.currentToken = nextToken.tokenId;
+
+  pushNotification({
+    facilityId: params.facilityId,
+    userId: nextToken.userId,
+    tokenId: nextToken.tokenId,
+    title: `Token ${nextToken.tokenId} Called`,
+    message: `${params.counter.label} (${params.counter.staffName}) is calling token ${nextToken.tokenId} at ${params.queue.location}.`,
+    category: 'turn',
+  });
+
+  // Notify approaching checked-in tokens (1-2 positions behind)
+  const approaching = candidates.slice(1, 3);
+  for (let i = 0; i < approaching.length; i += 1) {
+    const appTok = approaching[i];
+    const ahead = i + 1;
+    pushNotification({
+      facilityId: params.facilityId,
+      userId: appTok.userId,
+      tokenId: appTok.tokenId,
+      title: `Turn Approaching · ${appTok.tokenId}`,
+      message: `${ahead} ${ahead === 1 ? 'person' : 'people'} ahead of you at ${
+        params.queue.location
+      }. Please walk toward ${params.counter.label}.`,
+      category: 'turn',
+    });
+  }
+
+  return nextToken;
 }
 
 export function callNextAtCounter(
   facilityId: string,
   counterId: string,
-  actor?: ActorInfo
+  actor?: ActorInfo,
+  now: Date = new Date()
 ): {
   calledTokenId: string;
   queueId: string;
   snapshot: FacilitySnapshot;
 } {
   const db = dbStore.getState();
+  const todayIst = getIstDateIso(now);
   const counter = db.counters.find(
     (c) => c.facilityId === facilityId && c.id === counterId
   );
@@ -585,108 +1364,76 @@ export function callNextAtCounter(
     throw new Error(`Queue '${queue.name}' is currently paused.`);
   }
 
-  const nowTime = formatNowTime();
+  const nowTime = getIstTimeFormatted(now);
 
-  // Complete any currently Serving/Called token assigned to this counter/queue so the counter stays clean
+  // Complete any currently Serving/Called token assigned to this counter on today's IST date
   for (const t of db.tokens) {
     if (
       t.facilityId === facilityId &&
       t.queueId === queue.id &&
-      (t.status === 'Serving' || t.status === 'Called')
+      (t.appointmentDate || todayIst) === todayIst &&
+      (t.status === 'Serving' || t.status === 'Called') &&
+      (!t.counterId || t.counterId === counter.id)
     ) {
       t.status = 'Completed';
       t.completedAt = nowTime;
+      t.completedAtMs = now.getTime();
+      t.actualServiceMinutes = Math.max(
+        1,
+        Math.round(
+          (now.getTime() - (t.servingStartedAtMs || t.checkedInAtMs || t.createdAtMs)) / 60000
+        )
+      );
     }
   }
 
-  // Pick next waiting token in roster order if available, otherwise advance queue.servingNumber
-  const waitingCandidates = db.tokens
-    .filter(
-      (t) =>
-        t.facilityId === facilityId &&
-        t.queueId === queue.id &&
-        t.status === 'Waiting'
-    )
-    .sort((a, b) => a.numberValue - b.numberValue);
+  const promoted = promoteNextCheckedInToken({
+    facilityId,
+    queue,
+    counter,
+    actor,
+    now,
+  });
 
-  let calledTokenId: string;
-  let targetToken: TokenRecord | undefined;
-
-  if (waitingCandidates.length > 0) {
-    targetToken = waitingCandidates[0];
-    queue.servingNumber = targetToken.numberValue;
-    calledTokenId = targetToken.tokenId;
-    targetToken.status = 'Called';
-    targetToken.calledAt = nowTime;
-    targetToken.counterId = counter.id;
-    targetToken.assignedOperatorId = actor?.id || counter.assignedOperatorId;
-  } else {
-    queue.servingNumber += 1;
-    calledTokenId = `${queue.prefix}-${queue.servingNumber}`;
+  if (!promoted) {
+    throw new Error(`No checked-in waiting patients left in ${queue.name} for today (${todayIst}).`);
   }
 
-  counter.currentToken = calledTokenId;
   counter.status = 'Serving';
   db.metrics.processedDelta += 1;
-
-  // Notify approaching tokens (1-2 positions ahead)
-  const approaching = db.tokens.filter(
-    (t) =>
-      t.facilityId === facilityId &&
-      t.queueId === queue.id &&
-      t.status === 'Waiting' &&
-      t.numberValue - queue.servingNumber > 0 &&
-      t.numberValue - queue.servingNumber <= 2
-  );
-  for (const appTok of approaching) {
-    const ahead = appTok.numberValue - queue.servingNumber;
-    pushNotification({
-      facilityId,
-      userId: appTok.userId,
-      tokenId: appTok.tokenId,
-      title: `Turn Approaching · ${appTok.tokenId}`,
-      message: `${ahead} ${ahead === 1 ? 'person' : 'people'} ahead of you at ${queue.location}. Please walk back toward ${counter.label}.`,
-      category: 'turn',
-    });
-  }
-
-  pushNotification({
-    facilityId,
-    userId: targetToken?.userId,
-    tokenId: calledTokenId,
-    title: `Token ${calledTokenId} Called`,
-    message: `${counter.label} (${counter.staffName}) is calling token ${calledTokenId} at ${queue.location}.`,
-    category: 'turn',
-  });
 
   if (actor) {
     recordAuditLog({
       actor,
       action: 'TOKEN_CALLED',
       targetType: 'token',
-      targetId: calledTokenId,
+      targetId: promoted.tokenId,
       facilityId,
-      details: `Called ${calledTokenId} at ${counter.label} (${queue.name}).`,
+      details: `Called ${promoted.tokenId} at ${counter.label} (${queue.name}).`,
     });
   }
 
   dbStore.save();
 
   return {
-    calledTokenId,
+    calledTokenId: promoted.tokenId,
     queueId: queue.id,
-    snapshot: getFacilitySnapshot(facilityId)!,
+    snapshot: getFacilitySnapshot(facilityId, now)!,
   };
 }
 
-export function transitionTokenAtCounter(params: {
-  facilityId: string;
-  counterId: string;
-  tokenId: string;
-  action: 'recall' | 'serve' | 'complete' | 'skip' | 'no-show';
-  actor: ActorInfo;
-}): { token: TokenRecord; snapshot: FacilitySnapshot } {
+export function transitionTokenAtCounter(
+  params: {
+    facilityId: string;
+    counterId: string;
+    tokenId: string;
+    action: 'recall' | 'serve' | 'complete' | 'skip' | 'no-show';
+    actor: ActorInfo;
+  },
+  now: Date = new Date()
+): { token: TokenRecord; snapshot: FacilitySnapshot } {
   const db = dbStore.getState();
+  const todayIst = getIstDateIso(now);
   const counter = db.counters.find(
     (c) => c.facilityId === params.facilityId && c.id === params.counterId
   );
@@ -701,7 +1448,10 @@ export function transitionTokenAtCounter(params: {
     throw new Error(`Token '${params.tokenId}' not found.`);
   }
 
-  const nowTime = formatNowTime();
+  const queue = db.queues.find(
+    (q) => q.facilityId === params.facilityId && q.id === token.queueId
+  );
+  const nowTime = getIstTimeFormatted(now);
 
   switch (params.action) {
     case 'recall': {
@@ -730,6 +1480,9 @@ export function transitionTokenAtCounter(params: {
     }
 
     case 'serve': {
+      if ((token.appointmentDate || todayIst) !== todayIst || !token.checkedIn) {
+        throw new Error('Only checked-in patients scheduled for today can be served.');
+      }
       if (!['Waiting', 'Called', 'Grace'].includes(token.status)) {
         throw new Error(`Cannot start serving token in status '${token.status}'.`);
       }
@@ -743,18 +1496,26 @@ export function transitionTokenAtCounter(params: {
         ) {
           other.status = 'Completed';
           other.completedAt = nowTime;
+          other.completedAtMs = now.getTime();
+          other.actualServiceMinutes = Math.max(
+            1,
+            Math.round(
+              (now.getTime() - (other.servingStartedAtMs || other.checkedInAtMs || other.createdAtMs)) /
+                60000
+            )
+          );
         }
       }
       token.status = 'Serving';
       token.servingStartedAt = nowTime;
+      token.servingStartedAtMs = now.getTime();
       token.counterId = counter.id;
       token.assignedOperatorId = params.actor.id;
       counter.currentToken = token.tokenId;
       counter.status = 'Serving';
 
-      const q = db.queues.find((fq) => fq.id === token.queueId);
-      if (q && token.numberValue > q.servingNumber) {
-        q.servingNumber = token.numberValue;
+      if (queue && token.numberValue > queue.servingNumber) {
+        queue.servingNumber = token.numberValue;
       }
 
       pushNotification({
@@ -782,18 +1543,24 @@ export function transitionTokenAtCounter(params: {
       }
       token.status = 'Completed';
       token.completedAt = nowTime;
+      token.completedAtMs = now.getTime();
+      token.actualServiceMinutes = Math.max(
+        1,
+        Math.round(
+          (now.getTime() - (token.servingStartedAtMs || token.checkedInAtMs || token.createdAtMs)) /
+            60000
+        )
+      );
       token.counterId = counter.id;
       token.assignedOperatorId = params.actor.id;
-      if (counter.currentToken === token.tokenId) {
-        counter.currentToken = '—';
-      }
       db.metrics.processedDelta += 1;
+
       pushNotification({
         facilityId: params.facilityId,
         userId: token.userId,
         tokenId: token.tokenId,
         title: `Service Completed · ${token.tokenId}`,
-        message: `Your visit for ${token.queueName} at ${counter.label} is complete.`,
+        message: `Your visit for ${token.queueName} at ${counter.label} completed in ${token.actualServiceMinutes} min.`,
         category: 'token',
       });
       recordAuditLog({
@@ -802,8 +1569,25 @@ export function transitionTokenAtCounter(params: {
         targetType: 'token',
         targetId: token.tokenId,
         facilityId: params.facilityId,
-        details: `Completed service for ${token.tokenId} at ${counter.label}.`,
+        details: `Completed service for ${token.tokenId} at ${counter.label} (${token.actualServiceMinutes}m).`,
       });
+
+      if (
+        db.settings.autoAdvanceOnComplete !== false &&
+        queue &&
+        !queue.isPaused &&
+        (counter.status === 'Serving' || counter.status === 'Busy')
+      ) {
+        promoteNextCheckedInToken({
+          facilityId: params.facilityId,
+          queue,
+          counter,
+          actor: params.actor,
+          now,
+        });
+      } else if (counter.currentToken === token.tokenId) {
+        counter.currentToken = '—';
+      }
       break;
     }
 
@@ -812,9 +1596,8 @@ export function transitionTokenAtCounter(params: {
         throw new Error(`Cannot skip token in status '${token.status}'.`);
       }
       token.status = 'Skipped';
-      if (counter.currentToken === token.tokenId) {
-        counter.currentToken = '—';
-      }
+      token.completedAt = nowTime;
+      token.completedAtMs = now.getTime();
       pushNotification({
         facilityId: params.facilityId,
         userId: token.userId,
@@ -831,6 +1614,23 @@ export function transitionTokenAtCounter(params: {
         facilityId: params.facilityId,
         details: `Skipped ${token.tokenId} at ${counter.label}.`,
       });
+      if (
+        db.settings.autoAdvanceOnComplete !== false &&
+        queue &&
+        !queue.isPaused &&
+        counter.currentToken === token.tokenId &&
+        (counter.status === 'Serving' || counter.status === 'Busy')
+      ) {
+        promoteNextCheckedInToken({
+          facilityId: params.facilityId,
+          queue,
+          counter,
+          actor: params.actor,
+          now,
+        });
+      } else if (counter.currentToken === token.tokenId) {
+        counter.currentToken = '—';
+      }
       break;
     }
 
@@ -839,9 +1639,8 @@ export function transitionTokenAtCounter(params: {
         throw new Error(`Cannot mark no-show for token in status '${token.status}'.`);
       }
       token.status = 'NoShow';
-      if (counter.currentToken === token.tokenId) {
-        counter.currentToken = '—';
-      }
+      token.completedAt = nowTime;
+      token.completedAtMs = now.getTime();
       pushNotification({
         facilityId: params.facilityId,
         userId: token.userId,
@@ -858,6 +1657,23 @@ export function transitionTokenAtCounter(params: {
         facilityId: params.facilityId,
         details: `Marked ${token.tokenId} as No Show at ${counter.label}.`,
       });
+      if (
+        db.settings.autoAdvanceOnComplete !== false &&
+        queue &&
+        !queue.isPaused &&
+        counter.currentToken === token.tokenId &&
+        (counter.status === 'Serving' || counter.status === 'Busy')
+      ) {
+        promoteNextCheckedInToken({
+          facilityId: params.facilityId,
+          queue,
+          counter,
+          actor: params.actor,
+          now,
+        });
+      } else if (counter.currentToken === token.tokenId) {
+        counter.currentToken = '—';
+      }
       break;
     }
   }
@@ -865,7 +1681,7 @@ export function transitionTokenAtCounter(params: {
   dbStore.save();
   return {
     token,
-    snapshot: getFacilitySnapshot(params.facilityId)!,
+    snapshot: getFacilitySnapshot(params.facilityId, now)!,
   };
 }
 
@@ -878,11 +1694,16 @@ export function createSwapRequest(params: {
   if (!db.settings.allowPeerSwaps) {
     throw new Error('Peer token swaps are currently disabled by system settings.');
   }
+  const todayIst = getIstDateIso();
   const token = db.tokens.find(
-    (t) => t.facilityId === params.facilityId && t.tokenId === params.tokenId
+    (t) =>
+      t.facilityId === params.facilityId &&
+      t.tokenId === params.tokenId &&
+      (t.appointmentDate || todayIst) === todayIst &&
+      (typeof t.checkedIn === 'boolean' ? t.checkedIn : true)
   );
   if (!token) {
-    throw new Error(`Token '${params.tokenId}' not found.`);
+    throw new Error(`Checked-in active token '${params.tokenId}' for today not found.`);
   }
 
   const existingOpen = db.swaps.find(
@@ -935,10 +1756,11 @@ export function acceptSwapRequest(params: {
     (t) =>
       t.facilityId === params.facilityId &&
       t.tokenId === params.targetTokenId &&
-      t.queueId === swap.queueId
+      t.queueId === swap.queueId &&
+      (typeof t.checkedIn === 'boolean' ? t.checkedIn : true)
   );
   if (!callerToken) {
-    throw new Error('Your active token is not eligible for this queue swap.');
+    throw new Error('Your checked-in active token is not eligible for this queue swap.');
   }
 
   const peerToken = db.tokens.find(
@@ -1022,7 +1844,8 @@ export function activateGraceSlot(
 export function checkInGraceSlot(
   facilityId: string,
   tokenId: string,
-  userId?: string
+  userId?: string,
+  now: Date = new Date()
 ): { trustScore: number; snapshot: FacilitySnapshot } {
   const db = dbStore.getState();
   const token = db.tokens.find(
@@ -1031,8 +1854,13 @@ export function checkInGraceSlot(
   if (!token) {
     throw new Error(`Token '${tokenId}' not found.`);
   }
+  const nowTime = getIstTimeFormatted(now);
   token.status = 'Serving';
-  token.servingStartedAt = formatNowTime();
+  token.checkedIn = true;
+  token.checkedInAt = token.checkedInAt || nowTime;
+  token.checkedInAtMs = token.checkedInAtMs || now.getTime();
+  token.servingStartedAt = nowTime;
+  token.servingStartedAtMs = now.getTime();
   token.graceExpiresAt = undefined;
 
   let trustScore = 103;
@@ -1047,7 +1875,7 @@ export function checkInGraceSlot(
   dbStore.save();
   return {
     trustScore,
-    snapshot: getFacilitySnapshot(facilityId)!,
+    snapshot: getFacilitySnapshot(facilityId, now)!,
   };
 }
 
@@ -1072,7 +1900,7 @@ function getTokenHour24(token: TokenRecord): number {
       return hr;
     }
   }
-  return new Date(token.createdAtMs || Date.now()).getHours();
+  return getIstHourMinute(new Date(token.createdAtMs || Date.now())).hour;
 }
 
 export type CrowdLevel = 'Low' | 'Medium' | 'High';
@@ -1439,7 +2267,7 @@ export function getOrganisationAnalyticsDashboard(params: {
       status: c.status,
       currentToken: c.currentToken,
       queueLength: hq?.waitingCount || 0,
-      estimatedWaitMins: c.status === 'Closed' ? hq?.predictedWaitMins || 0 : hq?.predictedWaitMins || 0,
+      estimatedWaitMins: hq?.isPaused ? 0 : hq?.predictedWaitMins || 0,
       avgCycleMins: c.avgCycleMins,
     };
   });
@@ -1457,7 +2285,7 @@ export function getOrganisationAnalyticsDashboard(params: {
     );
     const nextWaitEstimate =
       q.activeCounters > 0
-        ? computeQueueWaitMins(q, q.waitingCount, q.activeCounters + 1)
+        ? computeQueueWaitMins(q, q.waitingCount, q.activeCounters + 1) ?? q.predictedWaitMins
         : q.predictedWaitMins;
 
     let suggestedAction = 'Optimal counter allocation';
@@ -1489,7 +2317,7 @@ export function getOrganisationAnalyticsDashboard(params: {
   });
 
   // Upcoming Busy Hours predictions (historical pattern + current queue momentum)
-  const currentHour24 = new Date().getHours();
+  const currentHour24 = getIstHourMinute(new Date()).hour;
   const upcomingCandidates = hourlyFootfall
     .filter((h) => h.hour24 >= Math.min(14, currentHour24) || h.isPeak)
     .sort((a, b) => b.footfall - a.footfall)

@@ -21,6 +21,7 @@ import type {
 import {
   broadcastFacilitySnapshot,
   getFacilitySnapshot,
+  notifyQueueDisruption,
   reallocateCounterStaff,
   recordAuditLog,
 } from '../services/queueEngine.ts';
@@ -556,6 +557,7 @@ adminRoutes.patch('/queues/:queueId', (req, res) => {
   if (typeof avgServiceMinutes === 'number' && avgServiceMinutes >= 1) {
     queue.avgServiceMinutes = avgServiceMinutes;
   }
+  const prevPaused = Boolean(queue.isPaused);
   if (typeof isActive === 'boolean') queue.isActive = isActive;
   if (typeof isPaused === 'boolean') queue.isPaused = isPaused;
 
@@ -567,6 +569,17 @@ adminRoutes.patch('/queues/:queueId', (req, res) => {
     facilityId: queue.facilityId,
     details: `Updated queue ${queue.name} (active: ${queue.isActive}, paused: ${queue.isPaused}).`,
   });
+  if (typeof isPaused === 'boolean' && isPaused !== prevPaused) {
+    notifyQueueDisruption({
+      facilityId: queue.facilityId,
+      queueId: queue.id,
+      title: queue.isPaused ? `Queue Delay · ${queue.name}` : `Queue Resumed · ${queue.name}`,
+      message: queue.isPaused
+        ? `${queue.name} is temporarily paused by administration.`
+        : `${queue.name} has resumed service. Live waiting times are updating.`,
+      category: 'system',
+    });
+  }
   dbStore.save();
   broadcastFacilitySnapshot(queue.facilityId, 'org:queue-updated', { queue });
   res.json({ queue });
@@ -679,6 +692,7 @@ adminRoutes.patch('/counters/:counterId', (req, res) => {
     counter.queueId = q.id;
     counter.departmentId = q.departmentId;
   }
+  const prevStatus = counter.status;
   if (departmentId) counter.departmentId = departmentId;
   if (status && ['Serving', 'Busy', 'Paused', 'Closed'].includes(status)) {
     counter.status = status;
@@ -706,6 +720,18 @@ adminRoutes.patch('/counters/:counterId', (req, res) => {
     facilityId: counter.facilityId,
     details: `Updated ${counter.label} (status: ${counter.status}, staff: ${counter.staffName}).`,
   });
+  if (status && status !== prevStatus && (status === 'Paused' || status === 'Closed' || status === 'Serving')) {
+    notifyQueueDisruption({
+      facilityId: counter.facilityId,
+      queueId: counter.queueId,
+      title: `Counter Assignment Update · ${counter.label}`,
+      message:
+        status === 'Serving'
+          ? `${counter.label} (${counter.staffName}) is now open for service.`
+          : `${counter.label} is temporarily ${status.toLowerCase()}. Wait estimates adjusted.`,
+      category: 'system',
+    });
+  }
   dbStore.save();
   broadcastFacilitySnapshot(counter.facilityId, 'counter:updated', { counter });
   res.json({ counter });

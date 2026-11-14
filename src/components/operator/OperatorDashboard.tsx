@@ -16,6 +16,7 @@ import {
   Search,
   Volume2,
   Clock,
+  QrCode,
 } from 'lucide-react';
 import {
   api,
@@ -75,6 +76,7 @@ export const OperatorDashboard: React.FC<OperatorDashboardProps> = ({
   const [queueSearch, setQueueSearch] = useState('');
   const [queueFilter, setQueueFilter] = useState<'all' | 'Waiting' | 'Called' | 'Serving' | 'Grace'>('all');
   const [historyFilter, setHistoryFilter] = useState<'all' | 'Completed' | 'Skipped' | 'NoShow' | 'Cancelled'>('all');
+  const [qrInput, setQrInput] = useState('');
 
   const facilityId = workspace?.facility.id || user.assignedFacilityId || 'vja-hospital';
 
@@ -205,6 +207,27 @@ export const OperatorDashboard: React.FC<OperatorDashboardProps> = ({
       onToast(`${counter.label} status updated to ${status}`);
     } catch (err) {
       onToast(err instanceof Error ? err.message : 'Unable to update counter status.');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleOperatorQrCheckIn = async (payloadOrTokenId: string) => {
+    if (!counter) return;
+    const raw = payloadOrTokenId.trim();
+    if (!raw) {
+      onToast('Enter a QR payload or token ID to check in.');
+      return;
+    }
+    setBusyAction(`qr:${raw}`);
+    try {
+      const body = raw.startsWith('SQ:') ? { qrPayload: raw } : { tokenId: raw };
+      const res = await api.operatorQrCheckIn(counter.id, body);
+      setQrInput('');
+      await loadWorkspace();
+      onToast(`Checked in ${res.token.tokenId} into ${res.token.queueName}`);
+    } catch (err) {
+      onToast(err instanceof Error ? err.message : 'QR check-in verification failed.');
     } finally {
       setBusyAction(null);
     }
@@ -692,6 +715,75 @@ export const OperatorDashboard: React.FC<OperatorDashboardProps> = ({
                   </table>
                 </div>
               </div>
+
+              {/* Today's Pre-Booked QR Check-In Desk */}
+              <section className="p-5 bg-white border border-slate-200 rounded-xl space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <h2 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                      <QrCode className="w-4 h-4 text-teal-700" />
+                      <span>Today&apos;s Pre-Booked QR Check-In</span>
+                    </h2>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      Pre-booked appointments for today ({workspace.operator.todayDate}) enter the active queue only after QR verification.
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={qrInput}
+                      onChange={(e) => setQrInput(e.target.value)}
+                      placeholder="Scan QR or enter Token ID (e.g. Q-24)"
+                      className="px-3 py-1.5 text-xs font-mono bg-slate-50 border border-slate-300 rounded-lg focus:outline-none focus:border-teal-600 w-64"
+                    />
+                    <button
+                      type="button"
+                      disabled={!counter || busyAction !== null || !qrInput.trim()}
+                      onClick={() => handleOperatorQrCheckIn(qrInput)}
+                      className="px-3.5 py-1.5 bg-teal-600 hover:bg-teal-700 disabled:bg-slate-200 disabled:text-slate-400 text-white text-xs font-semibold rounded-lg cursor-pointer"
+                    >
+                      Verify QR
+                    </button>
+                  </div>
+                </div>
+
+                {(workspace.pendingCheckIns?.length ?? 0) === 0 ? (
+                  <p className="text-xs text-slate-500 py-2">
+                    No pending pre-booked appointments awaiting check-in right now.
+                  </p>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                    {workspace.pendingCheckIns!.map((pending) => (
+                      <div
+                        key={pending.tokenId}
+                        className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between gap-3"
+                      >
+                        <div className="min-w-0">
+                          <div className="font-mono font-bold text-sm text-slate-900">
+                            {pending.tokenId}
+                          </div>
+                          <div className="text-xs text-slate-700 truncate">
+                            {pending.citizenLabel}
+                          </div>
+                          <div className="text-[11px] font-mono text-teal-700 mt-0.5">
+                            {pending.appointmentSlot || 'Scheduled today'}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          disabled={!counter || busyAction !== null}
+                          onClick={() =>
+                            handleOperatorQrCheckIn(pending.qrCodePayload || pending.tokenId)
+                          }
+                          className="px-3 py-1.5 bg-teal-600 hover:bg-teal-700 disabled:bg-slate-200 text-white text-xs font-semibold rounded-lg cursor-pointer shrink-0"
+                        >
+                          Check In
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </section>
             </div>
           )}
 
@@ -1056,7 +1148,9 @@ export const OperatorDashboard: React.FC<OperatorDashboardProps> = ({
                               {item.completedAt || '—'}
                             </td>
                             <td className="py-3.5 px-4 font-mono tabular-nums text-xs text-slate-700">
-                              {item.waitMins} min
+                              {item.actualServiceMinutes
+                                ? `${item.actualServiceMinutes} min service`
+                                : `${item.waitMins} min`}
                             </td>
                             <td className="py-3.5 px-4">
                               <span

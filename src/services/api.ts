@@ -24,6 +24,13 @@ export type TokenStatus =
   | 'Skipped'
   | 'NoShow';
 
+export type QueueLifecycleState =
+  | 'Upcoming Appointment'
+  | 'Check-In Required'
+  | 'Active Queue'
+  | 'Completed'
+  | 'Cancelled';
+
 export interface AuthUser {
   id: string;
   name: string;
@@ -137,13 +144,26 @@ export interface ApiTokenRecord {
   joinedAt: string;
   appointmentDate?: string;
   appointmentSlot?: string;
+  isPreBooked?: boolean;
+  checkedIn?: boolean;
+  checkedInAt?: string;
+  actualServiceMinutes?: number;
+  qrCodePayload?: string;
+  queueLifecycleState?: QueueLifecycleState;
+  bookingStatusLabel?: string;
+  queueStatusLabel?: string;
+  checkInEligible?: boolean;
+  checkInStatusText?: string;
+  countdownText?: string;
+  currentServingToken?: string | null;
+  aheadCount: number | null;
+  etaMinutes: number | null;
+  waitStatusMessage?: string;
   calledAt?: string;
   servingStartedAt?: string;
   completedAt?: string;
   cancelledAt?: string;
   graceExpiresAt?: string;
-  aheadCount: number;
-  etaMinutes: number;
 }
 
 export interface ApiSwapRequest {
@@ -159,6 +179,7 @@ export interface ApiSwapRequest {
 
 export interface FacilitySnapshotResponse {
   facilityId: string;
+  todayIst?: string;
   departments: ApiDepartment[];
   queues: ApiQueue[];
   counters: ApiCounter[];
@@ -204,11 +225,17 @@ export interface CitizenHistoryItem {
   channel: EntryChannel;
   priority: QueuePriority;
   status: TokenStatus;
+  isPreBooked?: boolean;
+  checkedIn?: boolean;
+  checkedInAt?: string;
+  qrCodePayload?: string;
+  actualServiceMinutes?: number;
   joinedAt: string;
   appointmentDate?: string;
   appointmentSlot?: string;
   calledAt?: string;
   completedAt?: string;
+  completedAtMs?: number;
   cancelledAt?: string;
   createdAtMs: number;
 }
@@ -221,15 +248,31 @@ export interface OperatorLiveQueueItem {
   channel: EntryChannel;
   priority: QueuePriority;
   status: TokenStatus;
+  queueLifecycleState?: QueueLifecycleState;
+  checkedIn?: boolean;
+  isPreBooked?: boolean;
+  qrCodePayload?: string;
+  aheadCount?: number | null;
+  waitStatusMessage?: string;
   joinedAt: string;
   appointmentDate?: string;
   appointmentSlot?: string;
   calledAt?: string;
   servingStartedAt?: string;
-  etaMinutes: number;
+  etaMinutes: number | null;
   waitMinsSoFar: number;
   recallCount: number;
   createdAtMs: number;
+}
+
+export interface OperatorPendingCheckInItem {
+  tokenId: string;
+  citizenLabel: string;
+  queueId: string;
+  queueName: string;
+  appointmentDate?: string;
+  appointmentSlot?: string;
+  qrCodePayload?: string;
 }
 
 export interface OperatorHistoryItem {
@@ -238,9 +281,12 @@ export interface OperatorHistoryItem {
   queueName: string;
   channel: EntryChannel;
   status: TokenStatus;
+  appointmentDate?: string;
+  appointmentSlot?: string;
   joinedAt: string;
   calledAt?: string;
   completedAt?: string;
+  actualServiceMinutes?: number;
   waitMins: number;
 }
 
@@ -256,6 +302,7 @@ export interface OperatorWorkspaceResponse {
   counter: ApiCounter | null;
   queue: ApiQueue | null;
   liveQueue: OperatorLiveQueueItem[];
+  pendingCheckIns?: OperatorPendingCheckInItem[];
   history: OperatorHistoryItem[];
   metrics: {
     totalTokensToday: number;
@@ -289,6 +336,9 @@ export interface SystemSettings {
   enableEmailNotifications: boolean;
   workingHoursStart: string;
   workingHoursEnd: string;
+  timezone?: string;
+  checkInWindowBeforeMins?: number;
+  autoAdvanceOnComplete?: boolean;
   updatedAt: string;
 }
 
@@ -852,9 +902,25 @@ export const api = {
       citizenName?: string;
       appointmentDate?: string;
       appointmentSlot?: string;
+      isPreBooked?: boolean;
     }
   ): Promise<{ token: ApiTokenRecord; snapshot: FacilitySnapshotResponse }> {
     return apiRequest(`/api/queues/${encodeURIComponent(facilityId)}/tokens`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  },
+
+  async qrCheckIn(
+    facilityId: string,
+    body: {
+      qrPayload?: string;
+      tokenId?: string;
+      queueId?: string;
+      departmentId?: string;
+    }
+  ): Promise<{ token: ApiTokenRecord; snapshot: FacilitySnapshotResponse }> {
+    return apiRequest(`/api/queues/${encodeURIComponent(facilityId)}/check-in-qr`, {
       method: 'POST',
       body: JSON.stringify(body),
     });
@@ -932,6 +998,16 @@ export const api = {
   }> {
     return apiRequest(`/api/operator/counters/${encodeURIComponent(counterId)}/call-next`, {
       method: 'POST',
+    });
+  },
+
+  async operatorQrCheckIn(
+    counterId: string,
+    body: { qrPayload?: string; tokenId?: string }
+  ): Promise<{ token: ApiTokenRecord; snapshot: FacilitySnapshotResponse }> {
+    return apiRequest(`/api/operator/counters/${encodeURIComponent(counterId)}/check-in-qr`, {
+      method: 'POST',
+      body: JSON.stringify(body),
     });
   },
 

@@ -1,13 +1,21 @@
 import { Router } from 'express';
 import { dbStore } from '../db/store.ts';
 import { requireAuth } from '../middleware/authMiddleware.ts';
-import { getFacilitySnapshot } from '../services/queueEngine.ts';
+import {
+  getFacilitySnapshot,
+  hydrateTokenForCitizen,
+  syncCitizenAppointmentNotifications,
+} from '../services/queueEngine.ts';
 
 export const citizenRoutes = Router();
 
 // Protected citizen overview across active service centers
 citizenRoutes.get('/overview', requireAuth, (req, res) => {
   const db = dbStore.getState();
+  if (req.authUser?.sub) {
+    syncCitizenAppointmentNotifications(req.authUser.sub);
+  }
+
   const activeFacilities = db.facilities.filter((f) => f.isActive);
   const activeDepartments = db.departments.filter((d) => d.isActive);
 
@@ -28,12 +36,7 @@ citizenRoutes.get('/overview', requireAuth, (req, res) => {
         ['Waiting', 'Called', 'Serving', 'Grace'].includes(t.status)
     ) || null;
 
-  let activeTokenHydrated = null;
-  if (activeToken) {
-    const snap = getFacilitySnapshot(activeToken.facilityId);
-    activeTokenHydrated =
-      snap?.roster.find((r) => r.tokenId === activeToken.tokenId) || activeToken;
-  }
+  const activeTokenHydrated = activeToken ? hydrateTokenForCitizen(activeToken) : null;
 
   res.json({
     centers: facilitySnapshots,
@@ -75,11 +78,17 @@ citizenRoutes.get('/history', requireAuth, (req, res) => {
         channel: t.channel,
         priority: t.priority,
         status: t.status,
+        isPreBooked: t.isPreBooked,
+        checkedIn: t.checkedIn,
+        checkedInAt: t.checkedInAt,
+        qrCodePayload: t.qrCodePayload,
+        actualServiceMinutes: t.actualServiceMinutes,
         joinedAt: t.joinedAt,
         appointmentDate: t.appointmentDate,
         appointmentSlot: t.appointmentSlot,
         calledAt: t.calledAt,
         completedAt: t.completedAt,
+        completedAtMs: t.completedAtMs,
         cancelledAt: t.cancelledAt,
         createdAtMs: t.createdAtMs,
       };
